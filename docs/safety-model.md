@@ -1,0 +1,168 @@
+# Parq Safety Model
+
+> *"사용자가 우리를 신뢰해서 디스크를 맡겼다. 그 신뢰를 깨면 끝이다."*
+
+이 문서는 Parq가 데이터 손실을 어떻게 방지하는지 정의한다. 새 기능을 추가하려면 먼저 이 문서를 읽고, 새로운 위험을 도입한다면 이 문서를 갱신한 PR을 함께 올린다.
+
+## 위협 모델
+
+Parq가 막아야 하는 시나리오:
+
+1. **잘못된 디스크 선택** — 사용자가 USB로 알았는데 실제로는 시스템 디스크
+2. **사용 중인 볼륨 조작** — 마운트되어 파일이 열려 있는 볼륨에 파괴적 작업
+3. **부팅 의존 영역 파괴** — BitLocker 키, 페이지파일, 하이버네이션 파일을 가진 볼륨
+4. **작업 중간 크래시 / 정전** — 파티션 테이블이 inconsistent 상태로 남음
+5. **소프트웨어 버그 / 잘못된 IOCTL** — 우리 코드가 잘못된 LBA에 쓰는 경우
+6. **Race condition** — 다른 도구가 동시에 디스크를 변경하는 경우
+
+## 4단계 작업 패턴
+
+모든 파괴적 작업(파티션 생성/삭제/포맷/리사이즈)은 다음 4단계를 **순서대로** 거친다. 단계를 건너뛰는 코드는 PR 거절 대상.
+
+### 1. Plan (read-only)
+
+```rust
+let plan: PartitionPlan = partition::plan_<operation>(&disk, params)?;
+```
+
+- 디스크 상태를 읽고, 어떤 변경이 필요한지 **계산만** 한다.
+- 디스크에 어떤 쓰기도 하지 않는다.
+- 결과: `PartitionPlan` 구조체. 사용자에게 보여줄 수 있는 형태.
+
+### 2. Validate (safety guards)
+
+```rust
+safety::validate(&plan)?;
+```
+
+다음을 모두 통과해야 한다:
+
+- 대상이 시스템 디스크가 **아니다** (V1 절대 금지)
+- 대상에 BitLocker 잠금이 없다 (또는 명시적 해제 동의)
+- 대상에 페이지파일/하이버네이션 파일이 없다
+- 대상 볼륨에 **사용 중인 핸들이 없다** (V1: 마운트되어 있으면 자동 거부)
+- 충분한 free space (리사이즈/이동 시)
+- 다른 Parq 작업이 같은 디스크에 진행 중이지 않다 (디스크 단위 lock)
+- 외장/제거 가능 미디어인지 확인 (V1 화이트리스트)
+
+검증 실패 시 `ParqError::SystemPartitionProtected`, `ValidationFailed` 등으로 거부. 우회 플래그(`--force`)는 V1에 추가하지 않는다.
+
+### 3. Preview (사용자 명시적 확인)
+
+- Tauri command가 `PartitionPlan`을 프론트엔드에 반환.
+- 프론트엔드는 다음을 사람이 읽을 수 있는 형태로 보여준다:
+  - 어떤 디스크인지 (모델명, 시리얼, 크기)
+  - 어떤 파티션이 변경/삭제/생성되는지
+  - 데이터 손실이 발생하는 영역 (강조)
+  - 예상 소요 시간
+- 사용자는 디스크 시리얼/라벨을 **타이핑**해서 확인한다 (단순 OK 버튼 금지).
+- 빨간색은 **돌이킬 수 없는** 작업에만. 위험하지만 되돌릴 수 있는 작업은 노란색/주황색.
+
+### 4. Execute (트랜잭션 + 실행)
+
+```rust
+let txn = transaction::begin(&plan)?;  // 디스크에 쓰기 전 로그 기록
+match partition::execute(&plan, &txn) {
+    Ok(_) => txn.commit()?,
+    Err(e) => {
+        txn.rollback()?;  // 가능한 한
+        return Err(e);
+    }
+}
+```
+
+- 트랜잭션 로그는 `%LOCALAPPDATA%\Parq\transactions\<uuid>.json` 같은 곳에 fsync로 기록.
+- 로그에는 변경 전 파티션 테이블 백업도 포함 (가능한 경우).
+- 작업 후 검증: 새 파티션 테이블을 다시 읽어서 의도한 상태인지 확인.
+
+## 시스템 디스크 정의
+
+`safety::is_system_disk()`는 다음 중 **하나라도** 해당되면 `true`:
+
+- Windows 부팅 볼륨이 위치한 디스크 (`GetSystemDirectoryW` → 볼륨 → 디스크)
+- EFI 시스템 파티션이 있는 디스크
+- 페이지파일이 위치한 볼륨이 있는 디스크 (`Win32_PageFileUsage`)
+- 하이버네이션 파일(`hiberfil.sys`)이 있는 볼륨이 있는 디스크
+- 현재 사용자 프로필이 있는 볼륨이 있는 디스크
+
+**V1에서 시스템 디스크 작업은 차단**한다. UI에서도 read-only로만 표시.
+
+## 외장 미디어 화이트리스트 (V1)
+
+V1에서 쓰기 작업을 허용하는 디스크는 다음을 모두 만족해야 한다:
+
+- `BusType`이 `USB`, `SD`, `MMC`, `IEEE1394`, 또는 `Storage Spaces`(외장)
+- 또는 `IsRemovable == true`
+- 그리고 시스템 디스크 정의의 어떤 조건에도 해당되지 않음
+
+내부 SATA/NVMe SSD/HDD는 V1에서 read-only. V2에서 확장.
+
+### 개발 전용 우회 (`PARQ_DEV_ALLOW_INTERNAL_DISKS`)
+
+VM 환경 (VMware/Hyper-V) 의 가상 NVMe 디스크나 `Mount-VHD` 로 마운트한 VHDX 는
+`BusType=Virtual` 또는 `BusType=NVMe` 로 인식되어 위 화이트리스트에 막힌다.
+개발자가 이런 환경에서 destructive 작업을 테스트할 수 있도록 환경 변수를 통한 명시적
+우회를 둔다.
+
+```sh
+# 개발/테스트용 — 일반 사용자 환경에서는 절대 설정하지 말 것
+PARQ_DEV_ALLOW_INTERNAL_DISKS=1 cargo run --example enumerate
+PARQ_DEV_ALLOW_INTERNAL_DISKS=1 cargo tauri dev
+```
+
+규칙:
+
+- 우회되는 가드는 **bus-type 검사뿐** 이다. 시스템 디스크 / 읽기 전용 / 부팅 파티션 /
+  시스템 파티션 / 마운트 상태 가드는 모두 그대로 적용된다.
+- 우회 활성 시 `WARN parq::safety` 로그가 매 호출마다 기록되어 사용 흔적을 남긴다.
+- UI / 사용자 설정 / `--force` CLI 플래그 / `tauri.conf` 어디에도 노출하지 않는다.
+  유일한 활성화 경로는 환경 변수.
+- 빌드 모드(debug/release) 와 무관하게 동작 — 릴리즈 빌드를 가져가서 실수로 켤 수도 있는
+  대신, 환경 변수 명을 의도적으로 길고 명시적으로 잡았다.
+
+## 트랜잭션 로그 포맷
+
+```json
+{
+  "id": "uuid-v4",
+  "started_at": "ISO-8601",
+  "operation": "delete_partition",
+  "disk": {
+    "id": "disk-serial-or-id",
+    "model": "...",
+    "size_bytes": 0
+  },
+  "plan_hash": "sha256",
+  "before": { "...디스크 상태 스냅샷..." },
+  "steps": [
+    { "step": "...", "status": "pending|done|failed" }
+  ],
+  "ended_at": null,
+  "result": null
+}
+```
+
+크래시 후 시작 시: `%LOCALAPPDATA%\Parq\transactions\` 스캔해서 `ended_at == null`인 로그가 있으면 사용자에게 보고하고 가능한 경우 복구 시도.
+
+## 절대 금지 사항 (코드 레벨)
+
+다음은 코드에 **절대로** 들어가면 안 된다:
+
+- `unwrap()` / `expect()` 프로덕션 경로
+- 안전 가드 우회 (`--force`, `unsafe_skip_check` 등)
+- 트랜잭션 없이 디스크에 쓰는 코드
+- `\\.\PhysicalDriveN` 하드코딩
+- 자동화된 테스트가 실제 물리 디스크에 쓰기
+- 시스템 디스크 검사를 디스크 인덱스(0번이면 시스템 등)로 추정 — **반드시** 위 정의된 검사 사용
+
+## 테스트 환경
+
+- 모든 파괴적 작업 테스트는 VHD/VHDX에서. (`scripts/create-test-vhd.ps1`)
+- 통합 테스트는 단일 스레드 (`--test-threads=1`)
+- CI에서 admin 권한 쓰기 테스트 금지
+
+## 변경 이력
+
+이 문서는 안전 모델을 변경하는 모든 PR에서 함께 갱신한다. 갱신 없이 모델을 우회하는 코드는 머지 거부.
+
+- 2026-04-28: 초기 작성 (V0 스캐폴드)

@@ -1,0 +1,1 @@
+{"root":["./src/app.tsx","./src/main.tsx","./src/types.ts","./src/components/disklist.tsx","./src/components/operationmodal.tsx","./src/components/partitionbar.tsx","./src/components/transactionlogpanel.tsx","./src/lib/disks.ts","./src/lib/format.ts","./src/lib/operations.ts","./src/lib/transactions.ts"],"version":"5.9.3"}
