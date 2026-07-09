@@ -7,6 +7,9 @@ pub mod error;
 pub mod fs;
 pub mod partition;
 pub mod platform;
+// V2 raw 디스크 I/O — read-only 파운데이션(Phase 2). Windows 전용. docs/v2-raw-io.md.
+#[cfg(windows)]
+pub mod raw_io;
 pub mod safety;
 pub mod transaction;
 

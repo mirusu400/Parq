@@ -33,10 +33,16 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 thiserror = "1.0"
 anyhow = "1.0"
 
+[dev-dependencies]
+# raw_io read 파운데이션의 SHA256 라운드트립 검증(example raw_read)이 hash-region.ps1 값과
+# 대조하기 위해서만 사용. 프로덕션 lib(raw_io)은 해시 의존성 없이 유지(docs/v2-raw-io.md §5 설계).
+sha2 = "0.10"
+
 [target.'cfg(windows)'.dependencies]
 # Windows API bindings — feature flags added per-module as needed.
 windows = { version = "0.58", features = [
     "Win32_Foundation",
+    "Win32_Security",           # CreateFileW 의 SECURITY_ATTRIBUTES 파라미터 타입 (raw_io, read-only open)
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
     "Win32_System_Ioctl",
