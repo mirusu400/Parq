@@ -20,6 +20,9 @@ use crate::{ParqError, Result};
 
 const DEV_BYPASS_ENV: &str = "PARQ_DEV_ALLOW_INTERNAL_DISKS";
 
+/// V2 destructive 기능(파티션 이동 / raw write) 알파 게이트 환경변수. docs/v2-charter.md §3-1·§5.
+const V2_DESTRUCTIVE_ENV: &str = "PARQ_ENABLE_V2_DESTRUCTIVE";
+
 /// 개발 전용 bus-type 가드 우회가 환경변수로 활성화되어 있는지 확인.
 /// "1" 또는 "true" (대소문자 무시) 면 활성. 그 외에는 비활성.
 fn dev_bypass_enabled() -> bool {
@@ -112,6 +115,37 @@ pub fn check_partition_destructive(disk: &Disk, partition: &Partition) -> Result
         return Err(ParqError::ValidationFailed(format!(
             "파티션 {} 은 현재 마운트되어 사용 중입니다 — 마운트 해제 후 다시 시도하세요",
             partition.id
+        )));
+    }
+    Ok(())
+}
+
+/// V2 destructive 기능 알파 게이트가 켜져 있는지. `PARQ_ENABLE_V2_DESTRUCTIVE` 가 "1" 또는
+/// "true"(대소문자 무시) 일 때만 true. docs/v2-charter.md §3-1·§5.
+///
+/// **V1 기능엔 전혀 영향 없다** — 이 게이트는 V2 파티션 이동 / raw write 경로만 판단한다.
+/// UI 노출 금지 (charter §3-1: 우연한 활성화 차단). `PARQ_DEV_ALLOW_INTERNAL_DISKS` 와 독립.
+#[must_use]
+pub fn v2_enabled() -> bool {
+    std::env::var(V2_DESTRUCTIVE_ENV)
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// V2 destructive 경로 진입 가드. 게이트가 꺼져 있으면 즉시 거부한다.
+///
+/// 모든 V2 파티션 이동 / raw write 커맨드는 실제 작업 전에 이 함수를 통과해야 한다
+/// (charter §3-1). 우회 플래그는 제공하지 않는다 (charter §2 비목표).
+#[instrument]
+pub fn require_v2_destructive() -> Result<()> {
+    if !v2_enabled() {
+        warn!(
+            target: "parq::safety",
+            "V2 destructive 요청이 거부됨 — {V2_DESTRUCTIVE_ENV} 미설정 (알파 게이트)"
+        );
+        return Err(ParqError::ValidationFailed(format!(
+            "V2 destructive 기능이 비활성화되어 있습니다 — 활성화하려면 {V2_DESTRUCTIVE_ENV}=1 \
+             환경변수가 필요합니다 (알파 게이트)"
         )));
     }
     Ok(())
@@ -290,5 +324,36 @@ mod tests {
         let err = check_partition_destructive(&disk, &p).unwrap_err();
         assert!(matches!(err, ParqError::ValidationFailed(_)));
         assert!(err.to_string().contains("외장 미디어가 아닙니다"));
+    }
+
+    #[test]
+    fn v2_gate_off_by_default_rejects() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var(V2_DESTRUCTIVE_ENV);
+        assert!(!v2_enabled());
+        let err = require_v2_destructive().unwrap_err();
+        assert!(matches!(err, ParqError::ValidationFailed(_)));
+        assert!(err.to_string().contains(V2_DESTRUCTIVE_ENV));
+    }
+
+    #[test]
+    fn v2_gate_on_allows() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        for val in ["1", "true", "TRUE", "True"] {
+            std::env::set_var(V2_DESTRUCTIVE_ENV, val);
+            assert!(v2_enabled(), "{val:?} 는 게이트를 켜야 함");
+            assert!(require_v2_destructive().is_ok());
+        }
+        std::env::remove_var(V2_DESTRUCTIVE_ENV);
+    }
+
+    #[test]
+    fn v2_gate_rejects_bogus_values() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        for val in ["0", "false", "yes", "", "2"] {
+            std::env::set_var(V2_DESTRUCTIVE_ENV, val);
+            assert!(!v2_enabled(), "{val:?} 는 게이트를 켜면 안 됨");
+        }
+        std::env::remove_var(V2_DESTRUCTIVE_ENV);
     }
 }

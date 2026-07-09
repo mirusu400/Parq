@@ -27,6 +27,9 @@ use windows::Win32::System::IO::DeviceIoControl;
 
 use crate::{ParqError, Result};
 
+/// 볼륨 lock / dismount 래퍼 (write 준비, 데이터 write 아님). docs/v2-raw-io.md §4.
+pub mod volume;
+
 /// 버퍼 정렬 상한. 512e(512)·4Kn(4096) 모두 커버. `FILE_FLAG_NO_BUFFERING` 요구(§3).
 const BUFFER_ALIGN: usize = 4096;
 

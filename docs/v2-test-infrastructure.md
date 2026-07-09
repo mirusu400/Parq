@@ -134,8 +134,9 @@ harness (test-only binary, VHD 대상):
 
 - [x] `scripts/vhd-matrix.ps1` — 커버링 세트 VHD + manifest 생성 (§1) *(2026-07-09, 구문 검증 통과. 실기 실행 미검증 — admin+Hyper-V 필요)*
 - [x] `scripts/hash-region.ps1` — PowerShell oracle 해시 (§2) *(2026-07-09, read-only, 구문 검증 통과)*
-- [ ] kill-test 하네스 Rust binary (§3) — **단, 자식의 이동 코드는 아직 없음 → 하네스는 mock
-      이동(단순 복사 루프)으로 먼저 자체 검증. 실제 이동 연결은 Phase 3.**
+- [x] kill-test 하네스 Rust binary (§3) — `examples/kill_test.rs`. mock 이동(일반 파일 청크복사
+      +checkpoint)으로 자체 검증: 5 시나리오(no-kill / kill@{0,7,15} × before_cursor·after_cursor)
+      모두 재시작→복구→byte-exact PASS. *(2026-07-09. 실제 이동 연결은 Phase 3.)*
 - [ ] 통합 테스트 VHD lifecycle 자동화 (§4)
 - [ ] CI 잡 정의 (§5) — self-hosted 러너 셋업 문서 포함
 
