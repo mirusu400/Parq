@@ -30,6 +30,9 @@ use crate::{ParqError, Result};
 /// 볼륨 lock / dismount 래퍼 (write 준비, 데이터 write 아님). docs/v2-raw-io.md §4.
 pub mod volume;
 
+/// raw 섹터 WRITE 프리미티브 (**파괴적**, 알파 게이트 뒤). docs/v2-raw-io.md §2.3·§5.
+pub mod write;
+
 /// 버퍼 정렬 상한. 512e(512)·4Kn(4096) 모두 커버. `FILE_FLAG_NO_BUFFERING` 요구(§3).
 const BUFFER_ALIGN: usize = 4096;
 
@@ -164,7 +167,7 @@ pub fn open_physical_drive_readonly(number: u32) -> Result<RawDisk> {
             total_bytes: 0,
         },
     };
-    disk.geometry = query_geometry(&disk)?;
+    disk.geometry = query_geometry(handle)?;
     debug!(
         target: "parq::raw_io",
         number,
@@ -176,14 +179,14 @@ pub fn open_physical_drive_readonly(number: u32) -> Result<RawDisk> {
 }
 
 /// `IOCTL_DISK_GET_DRIVE_GEOMETRY_EX` 로 논리 섹터 크기 + 총 바이트 조회. read-only.
-fn query_geometry(disk: &RawDisk) -> Result<DiskGeometry> {
+pub(super) fn query_geometry(handle: HANDLE) -> Result<DiskGeometry> {
     let mut geo = DISK_GEOMETRY_EX::default();
     let mut returned: u32 = 0;
 
     // SAFETY: out 버퍼는 DISK_GEOMETRY_EX 크기로 정확히 지정. read-only IOCTL(입력 버퍼 없음).
     unsafe {
         DeviceIoControl(
-            disk.handle,
+            handle,
             IOCTL_DISK_GET_DRIVE_GEOMETRY_EX,
             None,
             0,

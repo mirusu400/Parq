@@ -5,6 +5,9 @@ pub mod commands;
 pub mod disk;
 pub mod error;
 pub mod fs;
+// V2 파티션 이동 엔진(Phase 3). raw_io write 위에 checkpoint/방향/라운드트립. Windows 전용.
+#[cfg(windows)]
+pub mod move_engine;
 pub mod partition;
 pub mod platform;
 // V2 raw 디스크 I/O — read-only 파운데이션(Phase 2). Windows 전용. docs/v2-raw-io.md.

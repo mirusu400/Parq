@@ -22,6 +22,9 @@ tauri = { version = "2.10.3", features = [] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
+# Hashing — V2 move 엔진의 체크섬 라운드트립(charter §3-7) 무결성 검증 + raw_io 검증. charter §6 승인.
+sha2 = "0.10"
+
 # Async runtime
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs"] }
 
@@ -32,11 +35,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 # Error handling
 thiserror = "1.0"
 anyhow = "1.0"
-
-[dev-dependencies]
-# raw_io read 파운데이션의 SHA256 라운드트립 검증(example raw_read)이 hash-region.ps1 값과
-# 대조하기 위해서만 사용. 프로덕션 lib(raw_io)은 해시 의존성 없이 유지(docs/v2-raw-io.md §5 설계).
-sha2 = "0.10"
 
 [target.'cfg(windows)'.dependencies]
 # Windows API bindings — feature flags added per-module as needed.
