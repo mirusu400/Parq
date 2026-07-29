@@ -39,6 +39,9 @@ pub fn run() -> anyhow::Result<()> {
             commands::write::get_resize_limits,
             commands::write::plan_resize_partition,
             commands::write::execute_resize_partition_dangerous,
+            commands::v2::v2_destructive_enabled,
+            commands::v2::plan_move_partition,
+            commands::v2::execute_move_partition_dangerous,
         ])
         .run(tauri::generate_context!())
         .context("Tauri 애플리케이션 실행 실패")

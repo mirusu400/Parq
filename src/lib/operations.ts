@@ -8,6 +8,8 @@ import type {
   DeletePartitionPlan,
   DismountPlan,
   FileSystemKind,
+  MovePartitionPlan,
+  MovePartitionResult,
   ResizeLimits,
   ResizePartitionPlan,
   SetLabelPlan,
@@ -100,4 +102,35 @@ export async function executeResizePartition(
   plan: ResizePartitionPlan,
 ): Promise<void> {
   await invoke("execute_resize_partition_dangerous", { plan });
+}
+
+// ===== V2 파티션 이동 (알파 게이트 뒤) =====
+
+/** V2 destructive 알파 게이트가 켜져 있는지. UI 가 이동 컨트롤 노출 여부를 결정. */
+export async function v2DestructiveEnabled(): Promise<boolean> {
+  return invoke<boolean>("v2_destructive_enabled");
+}
+
+export async function planMovePartition(
+  diskId: string,
+  partitionId: string,
+  newStartBytes: number,
+): Promise<MovePartitionPlan> {
+  return invoke<MovePartitionPlan>("plan_move_partition", {
+    diskId,
+    partitionId,
+    newStartBytes,
+  });
+}
+
+export async function executeMovePartition(
+  diskId: string,
+  partitionId: string,
+  newStartBytes: number,
+): Promise<MovePartitionResult> {
+  return invoke<MovePartitionResult>("execute_move_partition_dangerous", {
+    diskId,
+    partitionId,
+    newStartBytes,
+  });
 }

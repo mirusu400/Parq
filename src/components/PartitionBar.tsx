@@ -6,6 +6,9 @@ import { formatBytes } from "../lib/format";
 interface Props {
   disk: Disk;
   onOperation: (op: Operation) => void;
+  /** V2 destructive 알파 게이트 상태. 꺼져 있으면 이동 버튼 미노출. */
+  v2Enabled: boolean;
+  onMove: (disk: Disk, partition: Partition) => void;
 }
 
 interface Segment {
@@ -99,6 +102,19 @@ function canResize(disk: Disk, p: Partition): boolean {
   return disk.isWritableV1 && !p.isBoot && !p.isSystem && p.fileSystem === "NTFS";
 }
 
+function canMove(disk: Disk, p: Partition, v2Enabled: boolean): boolean {
+  // V2 이동: 알파 게이트 ON + 쓰기 가능 + MBR (GPT 테이블 갱신 미구현) + 부팅/시스템 아님 +
+  // 마운트 해제 상태 (destructive 가드).
+  return (
+    v2Enabled &&
+    disk.isWritableV1 &&
+    disk.partitionStyle === "MBR" &&
+    !p.isBoot &&
+    !p.isSystem &&
+    !p.isInUse
+  );
+}
+
 // 드래그-리사이즈 안전 floor. 백엔드의 정확한 min 은 plan_resize_partition 이 검증함 —
 // 여기는 사용자가 음수/0 영역으로 드래그 못 하게만 막는 가드.
 const DRAG_MIN_BYTES = 10 * 1_000_000;
@@ -111,7 +127,12 @@ interface DragState {
   currentNewSizeBytes: number;
 }
 
-export default function PartitionBar({ disk, onOperation }: Props) {
+export default function PartitionBar({
+  disk,
+  onOperation,
+  v2Enabled,
+  onMove,
+}: Props) {
   const segments = buildSegments(disk);
   const totalForLayout = Math.max(disk.sizeBytes, 1);
   const barRef = useRef<HTMLDivElement>(null);
@@ -318,6 +339,16 @@ export default function PartitionBar({ disk, onOperation }: Props) {
                     className="rounded border border-neutral-700 px-2 py-0.5 text-[11px] text-neutral-300 hover:border-red-700 hover:text-red-200"
                   >
                     삭제
+                  </button>
+                )}
+                {canMove(disk, seg.partition, v2Enabled) && (
+                  <button
+                    type="button"
+                    onClick={() => onMove(disk, seg.partition!)}
+                    className="rounded border border-amber-800 px-2 py-0.5 text-[11px] text-amber-300 hover:border-amber-600 hover:text-amber-100"
+                    title="V2: 파티션을 미할당 영역으로 이동 (MBR)"
+                  >
+                    이동 (V2)
                   </button>
                 )}
               </span>

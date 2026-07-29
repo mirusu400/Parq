@@ -109,6 +109,27 @@ export interface ResizePartitionPlan {
   summary: string;
 }
 
+// ===== V2 파티션 이동 (destructive, 알파 게이트 뒤) — backend commands::v2 DTO 와 일치 =====
+
+export interface MovePartitionPlan {
+  diskNumber: number;
+  srcStartLba: number;
+  newStartLba: number;
+  lengthSectors: number;
+  /** "Forward" | "Backward" */
+  direction: string;
+  summary: string;
+}
+
+export interface MovePartitionResult {
+  partitionId: string;
+  oldStartLba: number;
+  newStartLba: number;
+  lengthSectors: number;
+  sha256: string;
+  resumed: boolean;
+}
+
 // ===== 트랜잭션 로그 (read-only) =====
 //
 // 다른 IPC 타입과 달리 snake_case 필드를 사용한다 — 백엔드 transaction::TransactionLog

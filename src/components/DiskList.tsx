@@ -1,4 +1,4 @@
-import type { Disk } from "../types";
+import type { Disk, Partition } from "../types";
 import type { Operation } from "./OperationModal";
 import { formatBytes } from "../lib/format";
 import PartitionBar from "./PartitionBar";
@@ -6,6 +6,8 @@ import PartitionBar from "./PartitionBar";
 interface Props {
   disks: Disk[];
   onOperation: (op: Operation) => void;
+  v2Enabled: boolean;
+  onMove: (disk: Disk, partition: Partition) => void;
 }
 
 function busTypeLabel(disk: Disk): string {
@@ -17,7 +19,12 @@ function freeBytesOf(disk: Disk): number {
   return Math.max(0, disk.sizeBytes - used);
 }
 
-export default function DiskList({ disks, onOperation }: Props) {
+export default function DiskList({
+  disks,
+  onOperation,
+  v2Enabled,
+  onMove,
+}: Props) {
   if (disks.length === 0) {
     return (
       <p className="text-sm text-neutral-500">표시할 디스크가 없습니다.</p>
@@ -74,7 +81,12 @@ export default function DiskList({ disks, onOperation }: Props) {
                 )}
               </div>
             </header>
-            <PartitionBar disk={disk} onOperation={onOperation} />
+            <PartitionBar
+              disk={disk}
+              onOperation={onOperation}
+              v2Enabled={v2Enabled}
+              onMove={onMove}
+            />
           </article>
         );
       })}

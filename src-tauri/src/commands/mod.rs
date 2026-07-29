@@ -6,4 +6,6 @@
 // - 모든 command 는 입력 검증 후 safety::guard 통과해야 실행한다.
 
 pub mod read;
+// V2 destructive commands (파티션 이동). 알파 게이트 뒤에서만.
+pub mod v2;
 pub mod write;
