@@ -1,0 +1,75 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="47 42 1040 1040" xmlns:c2pa="http://c2pa.org/manifest">
+  <defs>
+    <linearGradient id="tailGrad" x1="180" y1="140" x2="480" y2="960" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#F7C77E"/>
+      <stop offset="30%" stop-color="#E8892F"/>
+      <stop offset="62%" stop-color="#C25A3B"/>
+      <stop offset="100%" stop-color="#7A3A55"/>
+    </linearGradient>
+
+    <linearGradient id="headGrad" x1="700" y1="180" x2="520" y2="980" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#F8CB88"/>
+      <stop offset="35%" stop-color="#EC9A45"/>
+      <stop offset="70%" stop-color="#C4603E"/>
+      <stop offset="100%" stop-color="#763A54"/>
+    </linearGradient>
+
+    <linearGradient id="earGrad" x1="690" y1="130" x2="600" y2="420" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#9B5442"/>
+      <stop offset="100%" stop-color="#7A3E38"/>
+    </linearGradient>
+
+    <linearGradient id="nutGrad" x1="900" y1="655" x2="990" y2="835" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#F2AE55"/>
+      <stop offset="100%" stop-color="#CC7B3C"/>
+    </linearGradient>
+
+    <linearGradient id="gearGrad" x1="540" y1="600" x2="900" y2="980" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#63C3CE"/>
+      <stop offset="45%" stop-color="#4E79B8"/>
+      <stop offset="100%" stop-color="#5B57A0"/>
+    </linearGradient>
+  </defs>
+
+  <!-- base navy silhouette: gives the uniform outline around every shape -->
+  <polygon fill="#143348" points="263,113 136,245 136,449 265,351 325,405 221,588 221,832 407,1012 765,1012 783,961 846,975 912,908 888,867 900,843 943,834 943,750 896,724 888,700 918,663 843,591 841,559 907,553 998,464 943,311 849,235 809,123 746,208 684,124 616,230 606,419 579,446 578,243 462,118"/>
+
+  <!-- tail + lower body -->
+  <polygon fill="url(#tailGrad)" points="280,142 165,258 165,387 272,314 359,400 250,601 255,823 395,958 396,648 550,478 551,257 443,141"/>
+  <!-- soft low-poly facet accents on the tail -->
+  <polygon fill="#FBDFA0" opacity="0.5" points="280,142 443,141 365,255 300,230"/>
+  <polygon fill="#5B2A46" opacity="0.45" points="255,823 396,648 395,958"/>
+  <polygon fill="#C4602F" opacity="0.35" points="250,601 359,400 396,648 255,823"/>
+
+  <!-- body-right + head -->
+  <polygon fill="url(#headGrad)" points="686,179 645,279 695,372 641,323 632,435 428,657 433,983 659,981 631,955 589,978 521,909 545,866 490,833 490,738 537,724 522,661 589,593 631,615 669,562 739,559 660,476 673,460 755,530 897,524 951,475 924,451 959,439 921,331 831,259 754,258 727,312"/>
+  <polygon fill="#F9D6A0" opacity="0.45" points="897,524 951,475 924,451 959,439 921,331 870,400"/>
+  <polygon fill="#6E3550" opacity="0.4" points="433,983 490,833 490,738 545,866"/>
+
+  <!-- inner ear (darker facet) -->
+  <polygon fill="url(#earGrad)" points="684,124 616,230 606,400 641,323 695,372 645,279"/>
+
+  <!-- outer ear light tip -->
+  <polygon fill="#F6C583" points="805,180 771,227 816,228"/>
+
+  <!-- little nut / paw gem -->
+  <polygon fill="url(#nutGrad)" points="935,652 917,660 919,665 889,702 899,726 943,738 943,838 958,826 991,760 991,704 956,666"/>
+  <polygon fill="#F7D9A6" opacity="0.4" points="935,652 956,666 943,700 919,665"/>
+
+  <!-- small shoulder facet peeking above the gear -->
+  <polygon fill="#D9873C" points="765,560 776,603 803,615 813,611 815,608 813,560"/>
+
+  <!-- gear -->
+  <polygon fill="url(#gearGrad)" points="693,590 681,629 630,650 593,629 559,665 579,701 560,748 521,760 520,810 560,824 579,874 559,904 593,940 633,921 682,944 692,984 740,984 755,941 803,921 840,939 871,909 855,868 875,821 915,809 915,761 872,747 854,699 876,664 841,629 804,650 754,629 741,590"/>
+
+  <!-- inner white circle -->
+  <circle cx="717" cy="785" r="126" fill="#FFFFFF"/>
+
+  <!-- code symbol </> -->
+  <polygon fill="#143348" points="660,727 608,778 606,788 608,795 662,845 675,826 636,787 675,747"/>
+  <polygon fill="#143348" points="752,698 727,700 678,875 702,875"/>
+  <polygon fill="#143348" points="770,727 757,747 797,786 757,826 772,845 824,795 826,783"/>
+
+  <!-- eye -->
+  <polygon fill="#143348" points="777,354 834,351 869,404 799,403"/>
+</svg>

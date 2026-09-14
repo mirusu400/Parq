@@ -51,11 +51,14 @@ export default function App() {
   return (
     <main className="min-h-screen px-6 py-8">
       <header className="mb-8 flex items-end justify-between">
-        <div>
-          <h1 className="text-3xl font-semibold tracking-tight">Parq</h1>
-          <p className="mt-1 text-sm text-neutral-400">
-            Open source partition manager for Windows.
-          </p>
+        <div className="flex items-center gap-3.5">
+          <img src="/favicon.svg" alt="Parq Logo" className="h-11 w-11 rounded-xl shadow-sm" />
+          <div>
+            <h1 className="text-3xl font-semibold tracking-tight">Parq</h1>
+            <p className="mt-0.5 text-sm text-neutral-400">
+              Open source partition manager for Windows.
+            </p>
+          </div>
         </div>
         <div className="flex items-center gap-2">
           {v2Enabled && (

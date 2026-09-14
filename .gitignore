@@ -5,7 +5,6 @@ dist-ssr/
 *.local
 .claude/
 CLAUDE.MD
-README.MD
 
 # Editor
 .vscode/*
