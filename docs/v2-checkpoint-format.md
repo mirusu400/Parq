@@ -75,7 +75,7 @@ checkpoint = {
     "chunks_total": 200,
     "chunks_done": 137,              // 이 수만큼은 매체에 확정됨(=fsync 완료)
     "next_chunk_index": 137,         // 재개 지점
-    "phase": "copying"               // "planning"|"locked"|"copying"|"table_update"|"done"|"aborting"
+    "phase": "copying"               // "planning"|"locked"|"copying"|"verifying"|"verified"|"table_update"|"done"|"aborting"
   },
 
   // 무결성 (charter §3-7)
@@ -141,6 +141,8 @@ src/dst 가 겹치고 dst > src (forward) 이면, 앞에서부터 복사할 때 
 | `planning` | 아직 아무것도 안 씀 | 로그 `aborted_before_write` 로 마감. 디스크 무변경. 안전. |
 | `locked` | lock 만 잡음, 복사 전 | 동일 — 무변경 마감. lock 은 프로세스 죽으며 해제됨. |
 | `copying` | 청크 복사 중 | **재개 또는 롤백** (§4.1) |
+| `verifying` | 복사 완료, 대상 SHA256 검증 중 | 대상 SHA256을 다시 계산하고 검증을 재개. |
+| `verified` | 데이터와 인접 영역 검증 완료 | 파티션 이동이면 `table_update`로 진행. raw 영역 이동이면 완료 상태. |
 | `table_update` | 데이터 복사 끝, 파티션 테이블 갱신 중 | §4.2 |
 | `done` | 완료 후 로그 마감 전 | 로그만 `committed` 로 마감. |
 | `aborting` | 이미 롤백 중이었음 | 롤백 재개. |
@@ -200,7 +202,8 @@ src→dst 로 바꾸는 중 죽음. 파티션 테이블 쓰기는 **단일 섹�
 - 검증 매트릭스(= `v2-test-infrastructure.md` 가 실행):
   - `copying` 중 kill × {forward, backward} × {overlap, non-overlap}
   - §3 순서의 3·4 **사이**(데이터 flush 후 / 커서 기록 전) kill → 재개 시 청크 재쓰기 멱등 확인
-  - `table_update` 중 kill → §4.2 테이블 3-상태 각각
+- `table_update` 중 kill → §4.2 테이블 3-상태 각각
+- 구현된 MBR 경로는 테이블 write 직전과 단일 sector write+flush 직후를 각각 강제 종료해 재개 검증
 - **통과 기준**: 위 모든 시나리오에서 최종 상태가 (a) 완전 이동 성공+무결성 통과, 또는 (b) 완전
   원상복구(src 온전) 중 하나. **"중간 손상"은 0건이어야 머지.**
 

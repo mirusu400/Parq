@@ -115,6 +115,11 @@ fn resolve(
             "새 시작 오프셋({new_start_bytes})이 섹터({sector}) 정렬이 아닙니다"
         )));
     }
+    if new_start_bytes < 1024 * 1024 {
+        return Err(ParqError::ValidationFailed(
+            "새 시작 오프셋은 MBR/부트 예약 영역 보호를 위해 최소 1 MiB 이상이어야 합니다".into(),
+        ));
+    }
     let src_lba = p.offset_bytes / sector;
     let dst_lba = new_start_bytes / sector;
     let len = p.size_bytes / sector;
@@ -180,7 +185,9 @@ fn checkpoint_path(partition_id: &str) -> Result<std::path::PathBuf, ParqError> 
     let local = std::env::var("LOCALAPPDATA").map_err(|_| {
         ParqError::Platform("LOCALAPPDATA 환경변수가 설정되어 있지 않습니다".into())
     })?;
-    let dir = std::path::PathBuf::from(local).join("Parq").join("checkpoints");
+    let dir = std::path::PathBuf::from(local)
+        .join("Parq")
+        .join("checkpoints");
     std::fs::create_dir_all(&dir)
         .map_err(|e| ParqError::Platform(format!("checkpoint 디렉토리 생성 실패: {e}")))?;
     let safe: String = partition_id

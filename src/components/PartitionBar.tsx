@@ -80,6 +80,7 @@ const RELABELABLE_FS = ["FAT32", "exFAT", "NTFS"];
 function canRelabel(disk: Disk, p: Partition): boolean {
   return (
     disk.isWritableV1 &&
+    p.bitlockerStatus === "NotEncrypted" &&
     !p.isBoot &&
     !p.isSystem &&
     p.driveLetter !== null &&
@@ -89,26 +90,46 @@ function canRelabel(disk: Disk, p: Partition): boolean {
 
 function canDelete(disk: Disk, p: Partition): boolean {
   // V1 destructive 가드는 마운트 해제 (drive letter 없음) 를 요구한다.
-  return disk.isWritableV1 && !p.isBoot && !p.isSystem && !p.isInUse;
+  return (
+    disk.isWritableV1 &&
+    p.bitlockerStatus === "NotEncrypted" &&
+    !p.isBoot &&
+    !p.isSystem &&
+    !p.isInUse
+  );
 }
 
 function canDismount(disk: Disk, p: Partition): boolean {
   // 드라이브 문자가 있어야 제거 의미가 있음. 메타 작업이라 마운트 상태에서도 허용.
-  return disk.isWritableV1 && !p.isBoot && !p.isSystem && p.driveLetter !== null;
+  return (
+    disk.isWritableV1 &&
+    p.bitlockerStatus === "NotEncrypted" &&
+    !p.isBoot &&
+    !p.isSystem &&
+    p.driveLetter !== null
+  );
 }
 
 function canResize(disk: Disk, p: Partition): boolean {
-  // V1 은 NTFS 만 리사이즈 가능 (Resize-Partition 한계).
-  return disk.isWritableV1 && !p.isBoot && !p.isSystem && p.fileSystem === "NTFS";
+  const systemBootVolume =
+    disk.isSystem && p.isBoot && !p.isSystem && p.driveLetter !== null;
+  const offlineDataVolume =
+    disk.isWritableV1 && !p.isBoot && !p.isSystem && !p.isInUse;
+  return (
+    p.bitlockerStatus === "NotEncrypted" &&
+    p.fileSystem === "NTFS" &&
+    (systemBootVolume || offlineDataVolume)
+  );
 }
 
 function canMove(disk: Disk, p: Partition, v2Enabled: boolean): boolean {
-  // V2 이동: 알파 게이트 ON + 쓰기 가능 + MBR (GPT 테이블 갱신 미구현) + 부팅/시스템 아님 +
+  // V2 이동: 알파 게이트 ON + 쓰기 가능 + MBR/GPT + 부팅/시스템 아님 +
   // 마운트 해제 상태 (destructive 가드).
   return (
     v2Enabled &&
     disk.isWritableV1 &&
-    disk.partitionStyle === "MBR" &&
+    p.bitlockerStatus === "NotEncrypted" &&
+    (disk.partitionStyle === "MBR" || disk.partitionStyle === "GPT") &&
     !p.isBoot &&
     !p.isSystem &&
     !p.isInUse
@@ -275,7 +296,7 @@ export default function PartitionBar({
               />
               <span>
                 {seg.kind === "partition"
-                  ? `${seg.partition?.driveLetter ? seg.partition.driveLetter + ": " : ""}${seg.partition?.label ?? "(라벨 없음)"} · ${seg.partition?.fileSystem} · ${formatBytes(seg.sizeBytes)}`
+                  ? `${seg.partition?.driveLetter ? seg.partition.driveLetter + ": " : ""}${seg.partition?.label ?? "(라벨 없음)"} · ${seg.partition?.fileSystem} · ${formatBytes(seg.sizeBytes)}${seg.partition?.bitlockerStatus !== "NotEncrypted" ? ` · BitLocker ${seg.partition?.bitlockerStatus}` : ""}`
                   : `미할당 · ${formatBytes(seg.sizeBytes)}`}
               </span>
             </span>

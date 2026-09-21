@@ -81,7 +81,7 @@ export default function MovePartitionModal({
         <div className="mb-4 rounded border border-amber-800 bg-amber-950/40 p-3 text-xs text-amber-200">
           이동은 파티션 데이터를 새 위치로 복사하고 파티션 테이블을 갱신합니다. 진행 중 전원이
           꺼져도 checkpoint 에서 재개하며, 이동 후 SHA256 라운드트립으로 무결성을 검증합니다.
-          <span className="text-amber-400"> 현재 MBR 디스크만 지원합니다.</span>
+          <span className="text-amber-400"> 현재 오프라인 MBR/GPT 데이터 파티션을 지원합니다.</span>
         </div>
 
         {phase.stage === "form" && (
@@ -90,7 +90,7 @@ export default function MovePartitionModal({
               <span className="text-neutral-300">새 시작 오프셋 (MiB)</span>
               <input
                 type="number"
-                min={0}
+                min={1}
                 value={newStartMib}
                 onChange={(e) => setNewStartMib(Number(e.target.value))}
                 className="mt-1 w-full rounded border border-neutral-700 bg-neutral-800 px-3 py-2 text-sm"

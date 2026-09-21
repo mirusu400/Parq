@@ -66,7 +66,18 @@ pub enum FileSystemKind {
     Unknown,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum BitLockerStatus {
+    #[serde(rename = "NotEncrypted")]
+    NotEncrypted,
+    #[serde(rename = "Encrypted")]
+    Encrypted,
+    #[default]
+    #[serde(rename = "Unknown")]
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Disk {
     /// 안정적인 식별자 (시리얼 또는 디스크 GUID). 디스크 번호는 매번 바뀌므로 사용 금지.
@@ -87,7 +98,7 @@ pub struct Disk {
     pub is_writable_v1: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Partition {
     pub id: String,
@@ -101,6 +112,9 @@ pub struct Partition {
     pub is_boot: bool,
     pub is_system: bool,
     pub is_hidden: bool,
+    /// Windows BitLocker 상태. 조회 실패는 Unknown 으로 유지하며 쓰기 작업에서 안전 측으로 차단.
+    #[serde(default)]
+    pub bitlocker_status: BitLockerStatus,
     /// 마운트되어 사용 중이면 true — V1 에서 쓰기 작업 차단의 1차 신호.
     pub is_in_use: bool,
 }
@@ -179,12 +193,14 @@ mod tests {
             is_boot: false,
             is_system: false,
             is_hidden: false,
+            bitlocker_status: BitLockerStatus::NotEncrypted,
             is_in_use: false,
         };
         let json = serde_json::to_string(&p).expect("serialize");
         assert!(json.contains("\"offsetBytes\":1048576"));
         assert!(json.contains("\"driveLetter\":\"E\""));
         assert!(json.contains("\"fileSystem\":\"exFAT\""));
+        assert!(json.contains("\"bitlockerStatus\":\"NotEncrypted\""));
         assert!(json.contains("\"isInUse\":false"));
     }
 }

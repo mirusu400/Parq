@@ -114,6 +114,20 @@ function unitFactor(u: SizeUnit): number {
   return 1_000_000_000_000;
 }
 
+function confirmationText(operation: Operation): string {
+  if (
+    operation.kind === "resizePartition" &&
+    operation.disk.isSystem &&
+    operation.partition.isBoot
+  ) {
+    const volume = operation.partition.driveLetter
+      ? `${operation.partition.driveLetter}:`
+      : "SYSTEM";
+    return `RESIZE ${volume} ${operation.disk.serial ?? operation.disk.model}`;
+  }
+  return operation.disk.model;
+}
+
 export default function OperationModal({
   operation,
   onClose,
@@ -271,7 +285,7 @@ export default function OperationModal({
 
   const handleExecute = async () => {
     if (phase.stage !== "preview") return;
-    if (phase.typed !== operation.disk.model) return;
+    if (phase.typed !== confirmationText(operation)) return;
     const plan = phase.plan;
     setPhase({ stage: "loadingExecute", plan });
     try {
@@ -356,8 +370,13 @@ export default function OperationModal({
 
         {phase.stage === "preview" && (
           <PreviewView
-            disk={operation.disk}
             summary={phase.plan.summary}
+            confirmation={confirmationText(operation)}
+            systemResize={
+              operation.kind === "resizePartition" &&
+              operation.disk.isSystem &&
+              operation.partition.isBoot
+            }
             typed={phase.typed}
             onTypedChange={(typed) => setPhase({ ...phase, typed })}
             onExecute={handleExecute}
@@ -589,11 +608,20 @@ function FormView(props: FormViewProps) {
       )}
 
       {operation.kind === "resizePartition" && resizeLimits && (
-        <ResizeForm
-          limits={resizeLimits}
-          newBytes={resizeNewBytes}
-          setNewBytes={setResizeNewBytes}
-        />
+        <>
+          {operation.disk.isSystem && operation.partition.isBoot && (
+            <div className="rounded border border-red-800 bg-red-950/40 p-3 text-xs text-red-200">
+              Windows가 현재 사용 중인 시스템 볼륨을 온라인 리사이즈합니다. BitLocker가
+              해제되어 있고 Windows가 보고한 지원 범위 안에서만 실행됩니다. 이동은 포함되지
+              않습니다.
+            </div>
+          )}
+          <ResizeForm
+            limits={resizeLimits}
+            newBytes={resizeNewBytes}
+            setNewBytes={setResizeNewBytes}
+          />
+        </>
       )}
 
       <div className="flex justify-end gap-2 pt-2">
@@ -620,8 +648,9 @@ function FormView(props: FormViewProps) {
 }
 
 interface PreviewProps {
-  disk: Disk;
   summary: string;
+  confirmation: string;
+  systemResize: boolean;
   typed: string;
   onTypedChange: (s: string) => void;
   onExecute: () => void;
@@ -629,8 +658,16 @@ interface PreviewProps {
 }
 
 function PreviewView(props: PreviewProps) {
-  const { disk, summary, typed, onTypedChange, onExecute, onCancel } = props;
-  const typedMatches = typed === disk.model;
+  const {
+    summary,
+    confirmation,
+    systemResize,
+    typed,
+    onTypedChange,
+    onExecute,
+    onCancel,
+  } = props;
+  const typedMatches = typed === confirmation;
 
   return (
     <div className="space-y-4">
@@ -638,9 +675,10 @@ function PreviewView(props: PreviewProps) {
         {summary}
       </pre>
       <div className="rounded border border-red-900 bg-red-950/30 p-3 text-sm text-red-300">
-        이 작업은 되돌릴 수 없을 수 있습니다. 확인하려면 디스크 모델명을 정확히
-        입력하세요:
-        <span className="ml-1 font-mono text-red-200">{disk.model}</span>
+        {systemResize
+          ? "시스템 볼륨 리사이즈입니다. VM 스냅샷 또는 백업을 확인한 뒤 다음 문구를 정확히 입력하세요:"
+          : "이 작업은 되돌릴 수 없을 수 있습니다. 확인하려면 디스크 모델명을 정확히 입력하세요:"}
+        <span className="ml-1 font-mono text-red-200">{confirmation}</span>
       </div>
       <input
         type="text"

@@ -10,7 +10,7 @@ use serde::Deserialize;
 use tracing::{debug, info, instrument, warn};
 use wmi::{COMLibrary, WMIConnection};
 
-use crate::disk::{BusType, Disk, FileSystemKind, Partition, PartitionStyle};
+use crate::disk::{BitLockerStatus, BusType, Disk, FileSystemKind, Partition, PartitionStyle};
 use crate::{ParqError, Result};
 
 const STORAGE_NS: &str = "ROOT\\Microsoft\\Windows\\Storage";
@@ -68,12 +68,23 @@ struct MsftVolume {
     file_system_label: Option<String>,
 }
 
+/// BitLocker 상태 출처. DeviceID 는 MSFT_Volume.Path 와 같은 볼륨 GUID 경로다.
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "PascalCase")]
+struct Win32EncryptableVolume {
+    device_id: String,
+    drive_letter: Option<String>,
+    protection_status: Option<u32>,
+    conversion_status: Option<u32>,
+}
+
 /// 시스템에 연결된 모든 디스크와 파티션을 열거한다. 블로킹 호출.
 ///
 /// 호출자(Tauri command)는 `spawn_blocking` 으로 감싸 비동기 컨텍스트를 막지 않도록 한다.
 #[instrument]
 pub fn enumerate_disks() -> Result<Vec<Disk>> {
-    let com = COMLibrary::new().map_err(|e| ParqError::Platform(format!("COM 초기화 실패: {e}")))?;
+    let com =
+        COMLibrary::new().map_err(|e| ParqError::Platform(format!("COM 초기화 실패: {e}")))?;
     let conn = WMIConnection::with_namespace_path(STORAGE_NS, com)
         .map_err(|e| ParqError::Platform(format!("Storage WMI 네임스페이스 연결 실패: {e}")))?;
 
@@ -86,6 +97,7 @@ pub fn enumerate_disks() -> Result<Vec<Disk>> {
     let raw_volumes: Vec<MsftVolume> = conn
         .raw_query("SELECT * FROM MSFT_Volume")
         .map_err(|e| ParqError::Platform(format!("MSFT_Volume 쿼리 실패: {e}")))?;
+    let (bitlocker_query_ok, bitlocker_by_mount) = query_bitlocker_statuses();
 
     info!(
         target: "parq::platform",
@@ -116,7 +128,14 @@ pub fn enumerate_disks() -> Result<Vec<Disk>> {
                 .get(&d.number)
                 .map(|v| v.as_slice())
                 .unwrap_or(&[]);
-            map_disk(d, parts, &volumes_by_letter, &volumes_by_path)
+            map_disk(
+                d,
+                parts,
+                &volumes_by_letter,
+                &volumes_by_path,
+                bitlocker_query_ok,
+                &bitlocker_by_mount,
+            )
         })
         .collect();
 
@@ -130,6 +149,8 @@ fn map_disk(
     raw_parts: &[&MsftPartition],
     vols_by_letter: &HashMap<char, &MsftVolume>,
     vols_by_path: &HashMap<&str, &MsftVolume>,
+    bitlocker_query_ok: bool,
+    bitlocker_by_mount: &HashMap<String, BitLockerStatus>,
 ) -> Disk {
     let serial = raw
         .serial_number
@@ -157,7 +178,15 @@ fn map_disk(
 
     let mut partitions: Vec<Partition> = raw_parts
         .iter()
-        .map(|p| map_partition(p, vols_by_letter, vols_by_path))
+        .map(|p| {
+            map_partition(
+                p,
+                vols_by_letter,
+                vols_by_path,
+                bitlocker_query_ok,
+                bitlocker_by_mount,
+            )
+        })
         .collect();
     partitions.sort_by_key(|p| p.offset_bytes);
 
@@ -184,8 +213,11 @@ fn map_partition(
     raw: &MsftPartition,
     vols_by_letter: &HashMap<char, &MsftVolume>,
     vols_by_path: &HashMap<&str, &MsftVolume>,
+    bitlocker_query_ok: bool,
+    bitlocker_by_mount: &HashMap<String, BitLockerStatus>,
 ) -> Partition {
-    let drive_letter_char = char_from_wmi_letter(raw.drive_letter.as_deref());
+    let drive_letter_char = char_from_wmi_letter(raw.drive_letter.as_deref())
+        .or_else(|| drive_letter_from_access_paths(raw.access_paths.as_deref()));
     let drive_letter = drive_letter_char.map(|c| c.to_string());
 
     // 볼륨 매칭: 드라이브 문자 → AccessPaths(\\?\Volume{...}\) 순.
@@ -201,7 +233,27 @@ fn map_partition(
     let label = volume
         .and_then(|v| v.file_system_label.clone())
         .filter(|s| !s.is_empty());
-    let file_system = file_system_from(volume.and_then(|v| v.file_system.as_deref()), &raw.gpt_type);
+    let file_system =
+        file_system_from(volume.and_then(|v| v.file_system.as_deref()), &raw.gpt_type);
+    let bitlocker_status = volume
+        .and_then(|v| v.path.as_deref())
+        .and_then(|path| {
+            bitlocker_by_mount
+                .get(&normalize_mount_point(path))
+                .copied()
+        })
+        .or_else(|| {
+            drive_letter.as_deref().and_then(|letter| {
+                bitlocker_by_mount
+                    .get(&normalize_mount_point(&format!("{letter}:")))
+                    .copied()
+            })
+        })
+        .unwrap_or(if bitlocker_query_ok {
+            BitLockerStatus::NotEncrypted
+        } else {
+            BitLockerStatus::Unknown
+        });
 
     let id = format!("disk{}-part{}", raw.disk_number, raw.partition_number);
 
@@ -216,10 +268,62 @@ fn map_partition(
         is_boot: raw.is_boot,
         is_system: raw.is_system,
         is_hidden: raw.is_hidden,
+        bitlocker_status,
         // V1 정책: 드라이브 문자가 부여되어 마운트된 볼륨은 사용 중으로 간주.
         // 더 엄격한 핸들 검사는 safety 모듈에서 별도 가드로 추가한다.
         is_in_use: drive_letter_char.is_some(),
     }
+}
+
+fn query_bitlocker_statuses() -> (bool, HashMap<String, BitLockerStatus>) {
+    let com = match COMLibrary::new() {
+        Ok(com) => com,
+        Err(error) => {
+            warn!(target: "parq::platform", %error, "BitLocker COM 초기화 실패");
+            return (false, HashMap::new());
+        }
+    };
+    let conn = match WMIConnection::with_namespace_path(
+        "ROOT\\CIMV2\\Security\\MicrosoftVolumeEncryption",
+        com,
+    ) {
+        Ok(conn) => conn,
+        Err(error) => {
+            warn!(target: "parq::platform", %error, "BitLocker WMI 네임스페이스 연결 실패");
+            return (false, HashMap::new());
+        }
+    };
+    let volumes: Vec<Win32EncryptableVolume> = match conn.raw_query(
+        "SELECT DeviceID, DriveLetter, ProtectionStatus, ConversionStatus \
+         FROM Win32_EncryptableVolume",
+    ) {
+        Ok(volumes) => volumes,
+        Err(error) => {
+            warn!(target: "parq::platform", %error, "BitLocker 상태 쿼리 실패");
+            return (false, HashMap::new());
+        }
+    };
+    let mut by_mount = HashMap::new();
+    for volume in volumes {
+        let status = bitlocker_status(&volume);
+        by_mount.insert(normalize_mount_point(&volume.device_id), status);
+        if let Some(letter) = volume.drive_letter.as_deref().filter(|s| !s.is_empty()) {
+            by_mount.insert(normalize_mount_point(letter), status);
+        }
+    }
+    (true, by_mount)
+}
+
+fn bitlocker_status(volume: &Win32EncryptableVolume) -> BitLockerStatus {
+    if volume.conversion_status == Some(0) && volume.protection_status == Some(0) {
+        BitLockerStatus::NotEncrypted
+    } else {
+        BitLockerStatus::Encrypted
+    }
+}
+
+fn normalize_mount_point(value: &str) -> String {
+    value.trim().trim_end_matches('\\').to_ascii_uppercase()
 }
 
 /// WMI Char16 (`Option<String>` 으로 도착) 을 도메인용 ASCII 문자로 정규화.
@@ -231,6 +335,14 @@ fn char_from_wmi_letter(letter: Option<&str>) -> Option<char> {
         return None;
     }
     Some(c.to_ascii_uppercase())
+}
+
+fn drive_letter_from_access_paths(access_paths: Option<&[String]>) -> Option<char> {
+    access_paths?.iter().find_map(|path| {
+        let bytes = path.as_bytes();
+        (bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic())
+            .then(|| (bytes[0] as char).to_ascii_uppercase())
+    })
 }
 
 fn file_system_from(name: Option<&str>, gpt_type: &Option<String>) -> FileSystemKind {
@@ -314,6 +426,14 @@ mod tests {
     }
 
     #[test]
+    fn drive_letter_falls_back_to_access_paths() {
+        let paths = vec![r"\\?\Volume{test}\".into(), r"s:\".into()];
+        assert_eq!(drive_letter_from_access_paths(Some(&paths)), Some('S'));
+        assert_eq!(drive_letter_from_access_paths(Some(&paths[..1])), None);
+        assert_eq!(drive_letter_from_access_paths(None), None);
+    }
+
+    #[test]
     fn bus_type_known_values() {
         assert_eq!(bus_type_from_wmi(7), BusType::Usb);
         assert_eq!(bus_type_from_wmi(11), BusType::Sata);
@@ -335,10 +455,7 @@ mod tests {
 
     #[test]
     fn file_system_from_name_known() {
-        assert_eq!(
-            file_system_from(Some("NTFS"), &None),
-            FileSystemKind::Ntfs
-        );
+        assert_eq!(file_system_from(Some("NTFS"), &None), FileSystemKind::Ntfs);
         assert_eq!(
             file_system_from(Some("FAT32"), &None),
             FileSystemKind::Fat32
@@ -347,10 +464,7 @@ mod tests {
             file_system_from(Some("exFAT"), &None),
             FileSystemKind::ExFat
         );
-        assert_eq!(
-            file_system_from(Some("ReFS"), &None),
-            FileSystemKind::ReFs
-        );
+        assert_eq!(file_system_from(Some("ReFS"), &None), FileSystemKind::ReFs);
     }
 
     #[test]
@@ -381,6 +495,30 @@ mod tests {
         assert_eq!(
             file_system_from(Some("NewFS"), &None),
             FileSystemKind::Unknown
+        );
+    }
+
+    #[test]
+    fn bitlocker_status_distinguishes_decrypted_and_encrypted() {
+        let mut volume = Win32EncryptableVolume {
+            device_id: r"\\?\Volume{test}\".into(),
+            drive_letter: Some("E:".into()),
+            protection_status: Some(0),
+            conversion_status: Some(0),
+        };
+        assert_eq!(bitlocker_status(&volume), BitLockerStatus::NotEncrypted);
+
+        volume.conversion_status = Some(1);
+        volume.protection_status = Some(1);
+        assert_eq!(bitlocker_status(&volume), BitLockerStatus::Encrypted);
+    }
+
+    #[test]
+    fn bitlocker_mount_points_are_case_and_slash_insensitive() {
+        assert_eq!(normalize_mount_point("e:\\"), "E:");
+        assert_eq!(
+            normalize_mount_point(r"\\?\Volume{ABC}\"),
+            normalize_mount_point(r"\\?\volume{abc}")
         );
     }
 }

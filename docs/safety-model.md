@@ -37,13 +37,17 @@ safety::validate(&plan)?;
 
 다음을 모두 통과해야 한다:
 
-- 대상이 시스템 디스크가 **아니다** (V1 절대 금지)
-- 대상에 BitLocker 잠금이 없다 (또는 명시적 해제 동의)
-- 대상에 페이지파일/하이버네이션 파일이 없다
-- 대상 볼륨에 **사용 중인 핸들이 없다** (V1: 마운트되어 있으면 자동 거부)
+- 대상이 시스템 디스크가 아니다. 단, 현재 부팅 중인 NTFS 볼륨의 `Resize-Partition` 온라인
+  리사이즈만 전용 가드로 예외 허용한다.
+- 대상 BitLocker 상태가 `NotEncrypted` 로 확인된다. 암호화/잠김/조회 실패는 모두 거부한다.
+- 삭제/리사이즈/이동 대상은 마운트되어 있지 않다 (V1은 드라이브 문자 존재를 사용 중 신호로 본다).
 - 충분한 free space (리사이즈/이동 시)
-- 다른 Parq 작업이 같은 디스크에 진행 중이지 않다 (디스크 단위 lock)
 - 외장/제거 가능 미디어인지 확인 (V1 화이트리스트)
+- execute 직전 디스크를 재열거하고 동일 입력으로 plan을 다시 계산했을 때 preview plan과 완전히 같다.
+
+시스템 볼륨 리사이즈 예외는 `is_system disk + is_boot partition + NTFS + drive letter +
+BitLocker NotEncrypted + writable disk` 조건을 모두 요구한다. EFI/MSR/Recovery와 시스템 볼륨
+이동은 이 예외에 포함되지 않는다.
 
 검증 실패 시 `ParqError::SystemPartitionProtected`, `ValidationFailed` 등으로 거부. 우회 플래그(`--force`)는 V1에 추가하지 않는다.
 
@@ -65,15 +69,17 @@ let txn = transaction::begin(&plan)?;  // 디스크에 쓰기 전 로그 기록
 match partition::execute(&plan, &txn) {
     Ok(_) => txn.commit()?,
     Err(e) => {
-        txn.rollback()?;  // 가능한 한
+        txn.fail()?;  // 실패 사실을 기록; 자동 원상복구를 의미하지 않음
         return Err(e);
     }
 }
 ```
 
-- 트랜잭션 로그는 `%LOCALAPPDATA%\Parq\transactions\<uuid>.json` 같은 곳에 fsync로 기록.
-- 로그에는 변경 전 파티션 테이블 백업도 포함 (가능한 경우).
-- 작업 후 검증: 새 파티션 테이블을 다시 읽어서 의도한 상태인지 확인.
+- 트랜잭션 감사 로그는 `%LOCALAPPDATA%\Parq\transactions\<id>.json` 에 fsync로 기록한다.
+- V1의 `failed` 결과는 실패 사실을 뜻하며 자동 원상복구를 뜻하지 않는다. 생성 중 포맷 실패처럼
+  부분 성공 가능성이 있는 작업은 단계 로그를 보고 수동 확인해야 한다.
+- V2 MBR/GPT 이동은 별도 checkpoint와 SHA256 검증으로 중단 후 재개한다. GPT는 backup
+  엔트리·헤더를 먼저 기록하고 primary 엔트리·헤더를 기록하며 각 경계를 checkpoint에 남긴다.
 
 ## 시스템 디스크 정의
 
@@ -138,11 +144,12 @@ PARQ_DEV_ALLOW_INTERNAL_DISKS=1 cargo tauri dev
     { "step": "...", "status": "pending|done|failed" }
   ],
   "ended_at": null,
-  "result": null
+  "result": "committed | failed: <reason> | dropped_without_finalize | null"
 }
 ```
 
-크래시 후 시작 시: `%LOCALAPPDATA%\Parq\transactions\` 스캔해서 `ended_at == null`인 로그가 있으면 사용자에게 보고하고 가능한 경우 복구 시도.
+크래시 후 로그는 UI에서 확인할 수 있다. V2 이동은 동일 이동 요청 시 checkpoint에서 재개하며,
+시작 시 자동 복구 안내 UI는 아직 후속 과제다.
 
 ## 절대 금지 사항 (코드 레벨)
 

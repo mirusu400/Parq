@@ -27,8 +27,9 @@ Most existing Windows partition tools are bloated with intrusive ads, bundleware
 - **Drive Serial Confirmation**: Dangerous actions require typing the target disk's serial number to prevent misclicks on the wrong drive.
 
 ### 2. Move & Resize Partitions Safely
-- **Seamless Space Reallocation**: Move unallocated space or reorder partitions to expand storage without reinstalling Windows.
-- **Integrity Checks & Rollback**: Every moved data block is verified with cryptographic checksums. If anything interrupts the process, Parq tracks the operation to prevent corruption.
+- **Resumable Data Moves**: Move supported offline MBR/GPT data partitions with durable checkpoints and overlap-safe copying.
+- **Integrity Checks & Resume**: Every moved data block is verified with cryptographic checksums. If anything interrupts the process, Parq resumes from a durable checkpoint.
+- **Windows Volume Resize**: Resize NTFS data volumes and the active Windows volume within limits reported by `Get-PartitionSupportedSize`. Active system-partition movement remains an offline-only roadmap item.
 
 ### 3. Clean, Fast, and 100% Free
 - **No Ads or Bloatware**: No bundled toolbars, trial limitations, or background telemetry services.

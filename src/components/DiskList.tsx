@@ -57,9 +57,9 @@ export default function DiskList({
                 {disk.isSystem && (
                   <span
                     className="rounded border border-amber-700 px-2 py-0.5 text-xs text-amber-400"
-                    title="시스템 디스크 — V1 에서는 read-only"
+                    title="시스템 디스크 — 현재 부팅 NTFS 볼륨의 Windows 온라인 리사이즈만 허용"
                   >
-                    시스템 디스크 (보호됨)
+                    시스템 디스크 (C: 리사이즈만 허용)
                   </span>
                 )}
                 {!disk.isWritableV1 && !disk.isSystem && (

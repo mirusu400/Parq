@@ -19,6 +19,8 @@ use windows::Win32::Storage::FileSystem::{
     FILE_FLAG_NO_BUFFERING, FILE_FLAG_WRITE_THROUGH, FILE_SHARE_READ, FILE_SHARE_WRITE,
     OPEN_EXISTING,
 };
+use windows::Win32::System::Ioctl::IOCTL_DISK_UPDATE_PROPERTIES;
+use windows::Win32::System::IO::DeviceIoControl;
 
 use super::{map_win_err, query_geometry, AlignedBuf, DiskGeometry};
 use crate::{disk, safety, ParqError, Result};
@@ -147,6 +149,25 @@ impl WritableDisk {
     pub fn flush(&self) -> Result<()> {
         // SAFETY: 유효 핸들.
         unsafe { FlushFileBuffers(self.handle) }.map_err(|e| map_win_err("FlushFileBuffers", &e))
+    }
+
+    /// 파티션 테이블을 바꾼 뒤 Windows 저장소 스택이 새 레이아웃을 다시 읽도록 요청한다.
+    pub fn update_properties(&self) -> Result<()> {
+        let mut returned = 0u32;
+        // SAFETY: 유효한 디스크 핸들, 입력/출력 버퍼가 없는 IOCTL 호출.
+        unsafe {
+            DeviceIoControl(
+                self.handle,
+                IOCTL_DISK_UPDATE_PROPERTIES,
+                None,
+                0,
+                None,
+                0,
+                Some(&mut returned),
+                None,
+            )
+        }
+        .map_err(|e| map_win_err("IOCTL_DISK_UPDATE_PROPERTIES", &e))
     }
 }
 

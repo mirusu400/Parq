@@ -10,14 +10,17 @@
 //! (`safety::require_v2_destructive`) 통과를 요구한다.
 #![deny(unsafe_op_in_unsafe_fn)]
 
+use core::ffi::c_void;
+
 use tracing::{info, instrument};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE};
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS, OPEN_EXISTING,
 };
 use windows::Win32::System::Ioctl::{
-    FSCTL_DISMOUNT_VOLUME, FSCTL_LOCK_VOLUME, FSCTL_UNLOCK_VOLUME,
+    FSCTL_DISMOUNT_VOLUME, FSCTL_LOCK_VOLUME, FSCTL_UNLOCK_VOLUME, VOLUME_DISK_EXTENTS,
 };
 use windows::Win32::System::IO::DeviceIoControl;
 
@@ -31,6 +34,80 @@ pub struct VolumeLock {
     handle: HANDLE,
     letter: String,
     locked: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VolumeExtent {
+    pub disk_number: u32,
+    pub starting_offset_bytes: u64,
+    pub extent_length_bytes: u64,
+}
+
+#[instrument]
+pub fn query_volume_extent(drive_letter: &str) -> Result<VolumeExtent> {
+    let letter = drive_letter.trim().trim_end_matches(':');
+    let is_single_alpha = letter.len() == 1
+        && letter
+            .chars()
+            .next()
+            .is_some_and(|character| character.is_ascii_alphabetic());
+    if !is_single_alpha {
+        return Err(ParqError::ValidationFailed(format!(
+            "invalid drive letter: {drive_letter:?}"
+        )));
+    }
+
+    let letter = letter.to_ascii_uppercase();
+    let path = format!(r"\\.\{letter}:");
+    let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR(wide.as_ptr()),
+            GENERIC_READ.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAGS_AND_ATTRIBUTES(0),
+            HANDLE::default(),
+        )
+    }
+    .map_err(|error| map_win_err(&format!("volume {letter}: open"), &error))?;
+
+    let mut extents = VOLUME_DISK_EXTENTS::default();
+    let mut returned = 0u32;
+    let ioctl_result = unsafe {
+        DeviceIoControl(
+            handle,
+            IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS,
+            None,
+            0,
+            Some(&mut extents as *mut _ as *mut c_void),
+            std::mem::size_of::<VOLUME_DISK_EXTENTS>() as u32,
+            Some(&mut returned),
+            None,
+        )
+    };
+    let _ = unsafe { CloseHandle(handle) };
+    ioctl_result.map_err(|error| map_win_err("volume disk extents IOCTL", &error))?;
+
+    if extents.NumberOfDiskExtents != 1 {
+        return Err(ParqError::ValidationFailed(format!(
+            "volume {letter}: has {} disk extents; exactly one is required",
+            extents.NumberOfDiskExtents
+        )));
+    }
+    let extent = extents.Extents[0];
+    let starting_offset_bytes = u64::try_from(extent.StartingOffset).map_err(|_| {
+        ParqError::ValidationFailed(format!("volume {letter}: has a negative starting offset"))
+    })?;
+    let extent_length_bytes = u64::try_from(extent.ExtentLength).map_err(|_| {
+        ParqError::ValidationFailed(format!("volume {letter}: has a negative extent length"))
+    })?;
+    Ok(VolumeExtent {
+        disk_number: extent.DiskNumber,
+        starting_offset_bytes,
+        extent_length_bytes,
+    })
 }
 
 impl VolumeLock {

@@ -16,7 +16,9 @@ fn main() {
     if args.len() != 4 {
         eprintln!(
             "사용법: {} <DiskNumber> <PartitionIndex> <NewSizeBytes>",
-            args.first().map(String::as_str).unwrap_or("resize_partition")
+            args.first()
+                .map(String::as_str)
+                .unwrap_or("resize_partition")
         );
         std::process::exit(2);
     }
@@ -104,10 +106,16 @@ fn main() {
     } else {
         println!("ℹ extend — 뒤쪽 미할당 영역을 흡수합니다.");
     }
-    print!(
-        "확인하려면 디스크 모델명을 정확히 입력하세요\n(\"{}\"): ",
-        plan.disk.model
-    );
+    let confirmation = if plan.disk.is_system && plan.partition.is_boot {
+        format!(
+            "RESIZE {}: {}",
+            plan.partition.drive_letter.as_deref().unwrap_or("SYSTEM"),
+            plan.disk.serial.as_deref().unwrap_or(&plan.disk.model)
+        )
+    } else {
+        plan.disk.model.clone()
+    };
+    print!("확인 문구를 정확히 입력하세요\n(\"{confirmation}\"): ");
     let _ = io::stdout().flush();
 
     let mut buf = String::new();
@@ -116,8 +124,8 @@ fn main() {
         std::process::exit(1);
     }
     let typed = buf.trim();
-    if typed != plan.disk.model {
-        eprintln!("모델명 불일치 — 취소합니다 (입력: {typed:?})");
+    if typed != confirmation {
+        eprintln!("확인 문구 불일치 — 취소합니다 (입력: {typed:?})");
         std::process::exit(1);
     }
 

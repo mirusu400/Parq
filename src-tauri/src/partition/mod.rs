@@ -14,7 +14,7 @@ use crate::transaction::{self, BeginParams};
 use crate::{fs as parq_fs, safety, ParqError, Result};
 
 /// 파티션 크기 요청.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "kind", content = "value")]
 pub enum SizeRequest {
     /// 정확한 바이트 수.
@@ -27,7 +27,7 @@ pub enum SizeRequest {
 ///
 /// `disk` 는 enumerate 시점의 스냅샷이라 execute 직전 상태와 다를 수 있다 — execute 가 다시
 /// 가드를 통과시키므로 안전.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreatePartitionPlan {
     pub disk: Disk,
@@ -38,6 +38,39 @@ pub struct CreatePartitionPlan {
     pub initialize_as_gpt: bool,
     /// 사람이 읽을 요약 (트랜잭션 로그 / 미리보기).
     pub summary: String,
+}
+
+fn reload_disk(expected: &Disk) -> Result<Disk> {
+    let current = crate::disk::enumerate()?
+        .into_iter()
+        .find(|disk| disk.id == expected.id)
+        .ok_or_else(|| {
+            ParqError::ValidationFailed(format!(
+                "계획 대상 디스크 {} 이 현재 연결된 디스크 목록에 없습니다 — 다시 새로고침하세요",
+                expected.id
+            ))
+        })?;
+    if current.number != expected.number
+        || current.serial != expected.serial
+        || current.size_bytes != expected.size_bytes
+        || current.model != expected.model
+    {
+        return Err(ParqError::ValidationFailed(
+            "계획 이후 디스크 식별 정보가 변경되었습니다 — 작업을 중단하고 다시 미리보기하세요"
+                .into(),
+        ));
+    }
+    Ok(current)
+}
+
+fn require_fresh_plan<T: PartialEq>(submitted: &T, current: &T) -> Result<()> {
+    if submitted != current {
+        return Err(ParqError::ValidationFailed(
+            "미리보기 이후 디스크 또는 파티션 상태가 변경되었습니다 — 새로고침 후 다시 미리보기하세요"
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 /// 빈 디스크 또는 free space 가 있는 디스크에 새 파티션 + 포맷을 생성하는 plan 을 만든다.
@@ -78,9 +111,7 @@ pub fn plan_create_partition(
 
     if let SizeRequest::Bytes(b) = size_request {
         if b == 0 {
-            return Err(ParqError::ValidationFailed(
-                "파티션 크기가 0 입니다".into(),
-            ));
+            return Err(ParqError::ValidationFailed("파티션 크기가 0 입니다".into()));
         }
         if b > disk.size_bytes {
             return Err(ParqError::ValidationFailed(format!(
@@ -127,11 +158,20 @@ pub fn plan_create_partition(
 /// 2. New-Partition -DiskNumber N -Size B|UseMaximumSize -AssignDriveLetter
 /// 3. fs::format_volume(드라이브 문자, FS, 라벨)
 ///
-/// 어느 단계에서든 실패하면 transaction 이 rolled_back 으로 마감되고 에러가 전파된다.
+/// 어느 단계에서든 실패하면 transaction 이 failed 로 마감되고 에러가 전파된다.
 /// 단, 부분 성공 (예: 1·2 성공, 3 실패) 시 자동 복구는 수행하지 않는다 — 단순 fwd-only
 /// 트랜잭션. 사용자는 로그를 보고 수동 복구하거나 다시 시도한다. (V2 에서 자동 cleanup 검토)
 #[instrument(skip(plan), fields(disk_id = %plan.disk.id))]
 pub fn execute_create_partition(plan: CreatePartitionPlan) -> Result<()> {
+    let current_disk = reload_disk(&plan.disk)?;
+    let current_plan = plan_create_partition(
+        &current_disk,
+        plan.size_request,
+        plan.file_system,
+        plan.label.clone(),
+    )?;
+    require_fresh_plan(&plan, &current_plan)?;
+    let plan = current_plan;
     // 진입 시 한 번 더 디스크 가드 — plan 시점 이후 환경이 바뀌었을 수 있음.
     safety::check_disk_writable(&plan.disk)?;
 
@@ -154,12 +194,12 @@ pub fn execute_create_partition(plan: CreatePartitionPlan) -> Result<()> {
         Ok(()) => txn.commit(),
         Err(e) => {
             let reason = e.to_string();
-            // rollback 자체가 실패해도 원래 에러를 우선시한다.
-            if let Err(re) = txn.rollback(&reason) {
+            // 실패 로그 마감 자체가 실패해도 원래 에러를 우선시한다.
+            if let Err(re) = txn.fail(&reason) {
                 tracing::warn!(
                     target: "parq::partition",
-                    rollback_error = %re,
-                    "rollback 마감 실패"
+                    finalize_error = %re,
+                    "실패 로그 마감 실패"
                 );
             }
             Err(e)
@@ -215,7 +255,7 @@ fn run_create_partition(
 }
 
 /// `set_label` 작업의 plan. 라벨은 메타데이터 변경이므로 마운트 상태에서도 허용.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SetLabelPlan {
     pub disk: Disk,
@@ -226,11 +266,7 @@ pub struct SetLabelPlan {
 
 /// 마운트된 파티션의 라벨을 새 값으로 바꾸는 plan 을 만든다. **read-only**.
 #[instrument(skip(disk, new_label), fields(disk_id = %disk.id, partition_id = partition_id))]
-pub fn plan_set_label(
-    disk: &Disk,
-    partition_id: &str,
-    new_label: String,
-) -> Result<SetLabelPlan> {
+pub fn plan_set_label(disk: &Disk, partition_id: &str, new_label: String) -> Result<SetLabelPlan> {
     let partition = disk
         .partitions
         .iter()
@@ -272,12 +308,15 @@ pub fn plan_set_label(
 /// `plan_set_label` 결과를 트랜잭션 안에서 실행한다.
 #[instrument(skip(plan), fields(disk_id = %plan.disk.id, partition_id = %plan.partition.id))]
 pub fn execute_set_label(plan: SetLabelPlan) -> Result<()> {
+    let current_disk = reload_disk(&plan.disk)?;
+    let current_plan = plan_set_label(&current_disk, &plan.partition.id, plan.new_label.clone())?;
+    require_fresh_plan(&plan, &current_plan)?;
+    let plan = current_plan;
     safety::check_partition_metadata_writable(&plan.disk, &plan.partition)?;
-    let drive_letter = plan
-        .partition
-        .drive_letter
-        .clone()
-        .ok_or_else(|| ParqError::ValidationFailed("파티션에 드라이브 문자가 없습니다".into()))?;
+    let drive_letter =
+        plan.partition.drive_letter.clone().ok_or_else(|| {
+            ParqError::ValidationFailed("파티션에 드라이브 문자가 없습니다".into())
+        })?;
 
     let disk_summary = format!(
         "디스크 #{} {} ({}, {:?})",
@@ -303,11 +342,11 @@ pub fn execute_set_label(plan: SetLabelPlan) -> Result<()> {
         Ok(()) => txn.commit(),
         Err(e) => {
             let reason = e.to_string();
-            if let Err(re) = txn.rollback(&reason) {
+            if let Err(re) = txn.fail(&reason) {
                 tracing::warn!(
                     target: "parq::partition",
-                    rollback_error = %re,
-                    "rollback 마감 실패"
+                    finalize_error = %re,
+                    "실패 로그 마감 실패"
                 );
             }
             Err(e)
@@ -319,7 +358,7 @@ pub fn execute_set_label(plan: SetLabelPlan) -> Result<()> {
 ///
 /// V1 은 NTFS 만 지원. min 은 immovable 파일 (MFT, 페이지파일, 하이버네이션 등) 위치에 의해
 /// Windows 가 결정하는 값. max 는 현재 위치 기준 뒤쪽 인접 미할당까지 포함한 최대 크기.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResizeLimits {
     pub current_bytes: u64,
@@ -338,7 +377,7 @@ pub fn query_resize_limits(disk: &Disk, partition_id: &str) -> Result<ResizeLimi
             ParqError::ValidationFailed(format!("파티션 {partition_id} 을 찾을 수 없습니다"))
         })?;
 
-    safety::check_partition_metadata_writable(disk, partition)?;
+    safety::check_partition_resize_writable(disk, partition)?;
     require_resizable_fs(partition.file_system)?;
 
     let supported = query_supported_size(disk.number, partition.index)?;
@@ -350,7 +389,7 @@ pub fn query_resize_limits(disk: &Disk, partition_id: &str) -> Result<ResizeLimi
 }
 
 /// `resize_partition` 작업의 plan.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResizePartitionPlan {
     pub disk: Disk,
@@ -377,7 +416,7 @@ pub fn plan_resize_partition(
             ParqError::ValidationFailed(format!("파티션 {partition_id} 을 찾을 수 없습니다"))
         })?;
 
-    safety::check_partition_metadata_writable(disk, partition)?;
+    safety::check_partition_resize_writable(disk, partition)?;
     require_resizable_fs(partition.file_system)?;
 
     let supported = query_supported_size(disk.number, partition.index)?;
@@ -424,11 +463,16 @@ pub fn plan_resize_partition(
 
 /// `plan_resize_partition` 결과를 트랜잭션 안에서 실행한다.
 ///
-/// 단일 step `resize_partition` — `Resize-Partition` cmdlet 호출. 부분 실패 자동 cleanup
-/// 없음 (단일 step).
+/// `resize_partition`으로 `Resize-Partition`을 호출한 뒤 `verify_resize`에서 실제 크기를
+/// 다시 열거해 요청값과 정확히 일치하는지 확인한다.
 #[instrument(skip(plan), fields(disk_id = %plan.disk.id, partition_id = %plan.partition.id))]
 pub fn execute_resize_partition(plan: ResizePartitionPlan) -> Result<()> {
-    safety::check_partition_metadata_writable(&plan.disk, &plan.partition)?;
+    let current_disk = reload_disk(&plan.disk)?;
+    let current_plan =
+        plan_resize_partition(&current_disk, &plan.partition.id, plan.new_size_bytes)?;
+    require_fresh_plan(&plan, &current_plan)?;
+    let plan = current_plan;
+    safety::check_partition_resize_writable(&plan.disk, &plan.partition)?;
     require_resizable_fs(plan.partition.file_system)?;
 
     let disk_summary = format!(
@@ -448,23 +492,46 @@ pub fn execute_resize_partition(plan: ResizePartitionPlan) -> Result<()> {
     let disk_number = plan.disk.number;
     let partition_number = plan.partition.index;
     let new_size = plan.new_size_bytes;
-    let outcome = txn.run_step("resize_partition", move || {
-        let script = format!(
-            "Resize-Partition -DiskNumber {disk_number} -PartitionNumber {partition_number} \
-             -Size {new_size}"
-        );
-        powershell::run_command(&script).map(|_| ())
-    });
+    let expected_disk = plan.disk.clone();
+    let expected_partition_id = plan.partition.id.clone();
+    let outcome = (|| {
+        txn.run_step("resize_partition", move || {
+            let script = format!(
+                "Resize-Partition -DiskNumber {disk_number} -PartitionNumber {partition_number} \
+                 -Size {new_size} -Confirm:$false"
+            );
+            powershell::run_command(&script).map(|_| ())
+        })?;
+        txn.run_step("verify_resize", move || {
+            let current_disk = reload_disk(&expected_disk)?;
+            let current_partition = current_disk
+                .partitions
+                .iter()
+                .find(|partition| partition.id == expected_partition_id)
+                .ok_or_else(|| {
+                    ParqError::ValidationFailed(
+                        "리사이즈 후 대상 파티션을 다시 찾을 수 없습니다".into(),
+                    )
+                })?;
+            if current_partition.size_bytes != new_size {
+                return Err(ParqError::ValidationFailed(format!(
+                    "리사이즈 후 크기 검증 실패: actual={}, expected={new_size}",
+                    current_partition.size_bytes
+                )));
+            }
+            Ok(())
+        })
+    })();
 
     match outcome {
         Ok(()) => txn.commit(),
         Err(e) => {
             let reason = e.to_string();
-            if let Err(re) = txn.rollback(&reason) {
+            if let Err(re) = txn.fail(&reason) {
                 tracing::warn!(
                     target: "parq::partition",
-                    rollback_error = %re,
-                    "rollback 마감 실패"
+                    finalize_error = %re,
+                    "실패 로그 마감 실패"
                 );
             }
             Err(e)
@@ -525,7 +592,7 @@ fn query_supported_size(disk_number: u32, partition_number: u32) -> Result<PsSup
 ///
 /// destructive 작업 (삭제 / 포맷) 의 사전 단계로 자주 쓰인다 — V1 destructive 가드가
 /// 마운트된 파티션을 거부하므로 사용자가 먼저 마운트 해제하는 길.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DismountPlan {
     pub disk: Disk,
@@ -576,6 +643,10 @@ pub fn plan_dismount(disk: &Disk, partition_id: &str) -> Result<DismountPlan> {
 /// `plan_dismount` 결과를 트랜잭션 안에서 실행한다.
 #[instrument(skip(plan), fields(disk_id = %plan.disk.id, partition_id = %plan.partition.id))]
 pub fn execute_dismount(plan: DismountPlan) -> Result<()> {
+    let current_disk = reload_disk(&plan.disk)?;
+    let current_plan = plan_dismount(&current_disk, &plan.partition.id)?;
+    require_fresh_plan(&plan, &current_plan)?;
+    let plan = current_plan;
     safety::check_partition_metadata_writable(&plan.disk, &plan.partition)?;
 
     let disk_summary = format!(
@@ -609,11 +680,11 @@ pub fn execute_dismount(plan: DismountPlan) -> Result<()> {
         Ok(()) => txn.commit(),
         Err(e) => {
             let reason = e.to_string();
-            if let Err(re) = txn.rollback(&reason) {
+            if let Err(re) = txn.fail(&reason) {
                 tracing::warn!(
                     target: "parq::partition",
-                    rollback_error = %re,
-                    "rollback 마감 실패"
+                    finalize_error = %re,
+                    "실패 로그 마감 실패"
                 );
             }
             Err(e)
@@ -622,7 +693,7 @@ pub fn execute_dismount(plan: DismountPlan) -> Result<()> {
 }
 
 /// `delete_partition` 작업의 plan. 데이터 영구 손실이 발생하는 작업이라 가장 강한 가드 적용.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeletePartitionPlan {
     pub disk: Disk,
@@ -668,9 +739,13 @@ pub fn plan_delete_partition(disk: &Disk, partition_id: &str) -> Result<DeletePa
 /// `plan_delete_partition` 결과를 트랜잭션 안에서 실행한다.
 ///
 /// 단일 step `remove_partition` — `Remove-Partition` cmdlet 호출. 부분 실패 자동 cleanup
-/// 없음 (단일 step 이라 의미 없음). PowerShell 이 거부하면 트랜잭션 rollback 으로 마감.
+/// 없음 (단일 step 이라 의미 없음). PowerShell 이 거부하면 트랜잭션 failed 로 마감.
 #[instrument(skip(plan), fields(disk_id = %plan.disk.id, partition_id = %plan.partition.id))]
 pub fn execute_delete_partition(plan: DeletePartitionPlan) -> Result<()> {
+    let current_disk = reload_disk(&plan.disk)?;
+    let current_plan = plan_delete_partition(&current_disk, &plan.partition.id)?;
+    require_fresh_plan(&plan, &current_plan)?;
+    let plan = current_plan;
     safety::check_partition_destructive(&plan.disk, &plan.partition)?;
 
     let disk_summary = format!(
@@ -701,11 +776,11 @@ pub fn execute_delete_partition(plan: DeletePartitionPlan) -> Result<()> {
         Ok(()) => txn.commit(),
         Err(e) => {
             let reason = e.to_string();
-            if let Err(re) = txn.rollback(&reason) {
+            if let Err(re) = txn.fail(&reason) {
                 tracing::warn!(
                     target: "parq::partition",
-                    rollback_error = %re,
-                    "rollback 마감 실패"
+                    finalize_error = %re,
+                    "실패 로그 마감 실패"
                 );
             }
             Err(e)
@@ -732,7 +807,7 @@ fn format_bytes(b: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::disk::{BusType, FileSystemKind, PartitionStyle};
+    use crate::disk::{BitLockerStatus, BusType, FileSystemKind, PartitionStyle};
 
     fn raw_usb_disk() -> Disk {
         Disk {
@@ -770,39 +845,43 @@ mod tests {
     fn plan_no_init_for_gpt_disk() {
         let mut disk = raw_usb_disk();
         disk.partition_style = PartitionStyle::Gpt;
+        let plan =
+            plan_create_partition(&disk, SizeRequest::UseMaximum, FileSystemKind::Ntfs, None)
+                .expect("plan");
+        assert!(!plan.initialize_as_gpt);
+    }
+
+    #[test]
+    fn stale_or_modified_plan_is_rejected() {
+        let disk = raw_usb_disk();
         let plan = plan_create_partition(
             &disk,
-            SizeRequest::UseMaximum,
+            SizeRequest::Bytes(1_000_000_000),
             FileSystemKind::Ntfs,
-            None,
+            Some("DATA".into()),
         )
         .expect("plan");
-        assert!(!plan.initialize_as_gpt);
+        assert!(require_fresh_plan(&plan, &plan).is_ok());
+
+        let mut changed = plan.clone();
+        changed.disk.size_bytes += 512;
+        let err = require_fresh_plan(&plan, &changed).unwrap_err();
+        assert!(err.to_string().contains("상태가 변경"));
     }
 
     #[test]
     fn plan_rejects_unsupported_fs() {
         let disk = raw_usb_disk();
-        let err = plan_create_partition(
-            &disk,
-            SizeRequest::UseMaximum,
-            FileSystemKind::ReFs,
-            None,
-        )
-        .unwrap_err();
+        let err = plan_create_partition(&disk, SizeRequest::UseMaximum, FileSystemKind::ReFs, None)
+            .unwrap_err();
         assert!(matches!(err, ParqError::ValidationFailed(_)));
     }
 
     #[test]
     fn plan_rejects_zero_size() {
         let disk = raw_usb_disk();
-        let err = plan_create_partition(
-            &disk,
-            SizeRequest::Bytes(0),
-            FileSystemKind::Fat32,
-            None,
-        )
-        .unwrap_err();
+        let err = plan_create_partition(&disk, SizeRequest::Bytes(0), FileSystemKind::Fat32, None)
+            .unwrap_err();
         assert!(err.to_string().contains("0"));
     }
 
@@ -839,13 +918,9 @@ mod tests {
         let mut disk = raw_usb_disk();
         disk.bus_type = BusType::Nvme;
         disk.is_removable = false;
-        let err = plan_create_partition(
-            &disk,
-            SizeRequest::UseMaximum,
-            FileSystemKind::Fat32,
-            None,
-        )
-        .unwrap_err();
+        let err =
+            plan_create_partition(&disk, SizeRequest::UseMaximum, FileSystemKind::Fat32, None)
+                .unwrap_err();
         assert!(err.to_string().contains("외장 미디어"));
     }
 
@@ -861,6 +936,7 @@ mod tests {
             is_boot: false,
             is_system: false,
             is_hidden: false,
+            bitlocker_status: BitLockerStatus::NotEncrypted,
             is_in_use: true,
         }
     }

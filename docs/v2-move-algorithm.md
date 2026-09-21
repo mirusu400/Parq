@@ -146,7 +146,8 @@ MBR 은 파티션 엔트리 하나(시작 LBA + 길이)만 갱신하면 되지�
 3. 각 단계를 checkpoint `phase` 세분(`table_update_backup`/`table_update_primary`)해 복구 지점 명확화.
 4. 중간 죽음 시: primary 가 구(舊)면 전체가 아직 src → 롤백/재개 안전. primary 가 신(新)이면 성공.
 
-> GPT 이동은 Phase 3 후반 PR8 에서, MBR 이동(PR8 전반)이 kill-test 통과한 **후에** 착수.
+> 구현은 backup GPT → primary GPT 순서와 각 단계 checkpoint를 사용하며 실제 VHD 강제종료
+> 복구 매트릭스로 검증한다.
 
 ---
 

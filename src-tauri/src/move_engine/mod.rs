@@ -19,13 +19,16 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::{info, instrument, warn};
 
+use crate::raw_io::volume::VolumeLock;
 use crate::raw_io::write::{open_writable, WritableDisk};
 use crate::{disk, safety, ParqError, Result};
 
+mod ntfs_boot;
 mod partition_table;
 
 /// 청크 크기(바이트). 1 MiB. 섹터 배수로 내림해 사용.
 const CHUNK_BYTES: u64 = 1024 * 1024;
+const PARTITION_DATA_START_BYTES: u64 = 1024 * 1024;
 
 /// 복사 방향 (docs/v2-move-algorithm.md §2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -55,6 +58,18 @@ fn decide_direction(src_lba: u64, dst_lba: u64, len: u64) -> Direction {
     }
 }
 
+fn choose_chunk_sectors(plan: &MovePlan, base_chunk_sectors: u64) -> u64 {
+    if ranges_overlap(plan.src_lba, plan.dst_lba, plan.length_sectors) {
+        base_chunk_sectors.min(plan.src_lba.abs_diff(plan.dst_lba).max(1))
+    } else {
+        base_chunk_sectors
+    }
+}
+
+fn minimum_partition_start_lba(sector_bytes: u64) -> u64 {
+    PARTITION_DATA_START_BYTES.div_ceil(sector_bytes.max(1))
+}
+
 /// 진행 인덱스 `i`(0-based, 방향순) → 영역 시작으로부터의 (섹터 오프셋, 이 청크의 섹터 수).
 /// forward 는 앞에서부터, backward 는 뒤에서부터 물리 청크를 고른다. 나머지 청크는 마지막 물리 청크.
 fn chunk_at(
@@ -74,7 +89,7 @@ fn chunk_at(
 }
 
 /// 이동 계획 (read-only 로 계산).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MovePlan {
     pub disk_number: u32,
     pub src_lba: u64,
@@ -104,6 +119,16 @@ pub struct MoveOutcome {
     pub chunks: u64,
     pub direction: Direction,
     pub resumed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MoveEvent {
+    DataFlushed { chunk: u64, total: u64 },
+    CheckpointPersisted { chunk: u64, total: u64 },
+    BeforeTableWrite,
+    AfterGptBackupFlushed,
+    AfterGptPrimaryEntriesFlushed,
+    AfterTableWriteFlushed,
 }
 
 /// 이동 계획 계산 (read-only). 알파 게이트 통과 필수.
@@ -142,6 +167,22 @@ pub fn execute_move<P>(
 where
     P: FnMut(u64, u64),
 {
+    execute_move_with_events(plan, checkpoint_path, |event| {
+        if let MoveEvent::CheckpointPersisted { chunk, total } = event {
+            progress(chunk, total);
+        }
+    })
+}
+
+#[doc(hidden)]
+pub fn execute_move_with_events<P>(
+    plan: &MovePlan,
+    checkpoint_path: &Path,
+    mut on_event: P,
+) -> Result<MoveOutcome>
+where
+    P: FnMut(MoveEvent),
+{
     safety::require_v2_destructive()?;
 
     // 알파 게이트 + 디스크 가드는 open_writable 안에서 강제된다.
@@ -151,7 +192,8 @@ where
     if sector == 0 {
         return Err(ParqError::Platform("논리 섹터 크기 0".into()));
     }
-    let chunk_sectors = (CHUNK_BYTES / sector).max(1);
+    let base_chunk_sectors = (CHUNK_BYTES / sector).max(1);
+    let chunk_sectors = choose_chunk_sectors(plan, base_chunk_sectors);
     let chunks_total = plan.length_sectors.div_ceil(chunk_sectors);
 
     // 범위 검증: src/dst 어느 쪽도 디스크를 넘지 않는다.
@@ -170,13 +212,17 @@ where
     let (mut cp, resumed) = match load_checkpoint(checkpoint_path)? {
         Some(existing) => {
             // 재개: plan 이 일치해야 한다(다른 이동의 checkpoint 오용 방지).
-            if existing.plan.src_lba != plan.src_lba
-                || existing.plan.dst_lba != plan.dst_lba
-                || existing.plan.length_sectors != plan.length_sectors
-                || existing.plan.disk_number != plan.disk_number
-            {
+            if existing.log_format_version != 2 || existing.plan != *plan {
                 return Err(ParqError::ValidationFailed(
                     "checkpoint 의 plan 이 요청과 불일치 — 다른 이동의 로그일 수 있음".into(),
+                ));
+            }
+            if existing.chunk_sectors != chunk_sectors
+                || existing.chunks_total != chunks_total
+                || existing.chunks_done > existing.chunks_total
+            {
+                return Err(ParqError::ValidationFailed(
+                    "checkpoint 의 청크 기하가 현재 이동 계획과 불일치".into(),
                 ));
             }
             warn!(target: "parq::move", chunks_done = existing.chunks_done, "checkpoint 에서 이동 재개");
@@ -199,7 +245,13 @@ where
     // src SHA256 를 write 이전에 확정 (charter §3-7 라운드트립 기준값).
     // 겹침 이동에서 src 가 부분 훼손되기 전에 반드시 계산돼야 하므로 첫 write 전에.
     if cp.src_sha256.is_none() {
-        let sha = hash_region(&disk, plan.src_lba, plan.length_sectors, chunk_sectors, sector)?;
+        let sha = hash_region(
+            &disk,
+            plan.src_lba,
+            plan.length_sectors,
+            chunk_sectors,
+            sector,
+        )?;
         cp.src_sha256 = Some(sha);
         write_checkpoint(checkpoint_path, &cp)?;
     }
@@ -208,18 +260,29 @@ where
     let mut buf = vec![0u8; (chunk_sectors * sector) as usize];
     while cp.chunks_done < cp.chunks_total {
         let i = cp.chunks_done;
-        let (offset, this_sectors) =
-            chunk_at(i, cp.chunks_total, plan.length_sectors, chunk_sectors, plan.direction);
+        let (offset, this_sectors) = chunk_at(
+            i,
+            cp.chunks_total,
+            plan.length_sectors,
+            chunk_sectors,
+            plan.direction,
+        );
         let bytes = (this_sectors * sector) as usize;
         let slice = &mut buf[..bytes];
 
         disk.read_sectors(plan.src_lba + offset, slice)?; // (1)
         disk.write_sectors(plan.dst_lba + offset, slice)?; // (2)+(3) write_sectors 가 flush 포함
+        on_event(MoveEvent::DataFlushed {
+            chunk: i + 1,
+            total: cp.chunks_total,
+        });
 
         cp.chunks_done = i + 1; // (4)
         write_checkpoint(checkpoint_path, &cp)?; // fsync
-
-        progress(cp.chunks_done, cp.chunks_total);
+        on_event(MoveEvent::CheckpointPersisted {
+            chunk: cp.chunks_done,
+            total: cp.chunks_total,
+        });
     }
 
     // 라운드트립 검증 (§3-7): dst 영역 SHA256 == 이동 전 src SHA256.
@@ -229,7 +292,13 @@ where
         .src_sha256
         .clone()
         .ok_or_else(|| ParqError::Transaction("checkpoint 에 src_sha256 없음".into()))?;
-    let dst_sha = hash_region(&disk, plan.dst_lba, plan.length_sectors, chunk_sectors, sector)?;
+    let dst_sha = hash_region(
+        &disk,
+        plan.dst_lba,
+        plan.length_sectors,
+        chunk_sectors,
+        sector,
+    )?;
     if dst_sha != src_sha {
         return Err(ParqError::ValidationFailed(format!(
             "체크섬 라운드트립 불일치! 이동 실패 — src({src_sha}) != dst({dst_sha}). \
@@ -238,7 +307,7 @@ where
         )));
     }
 
-    cp.phase = "done".into();
+    cp.phase = "verified".into();
     write_checkpoint(checkpoint_path, &cp)?;
     info!(target: "parq::move", sha256 = %dst_sha, chunks = cp.chunks_total, "이동 + 라운드트립 검증 완료");
 
@@ -260,6 +329,12 @@ pub struct MovePartitionOutcome {
     pub length_sectors: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MoveMode {
+    Standard,
+    OfflineSystem { checkpoint_partition_start_lba: u64 },
+}
+
 /// **완결된 파티션 이동**: 데이터 이동 + 인접 무변경 검증 + 파티션 테이블 갱신.
 ///
 /// 길이는 파티션 테이블에서 읽어온다(호출자가 지정하지 않는다). 순서(charter 안전 모델):
@@ -270,7 +345,7 @@ pub struct MovePartitionOutcome {
 /// 5. 인접 파티션 무변경 재확인 — 변경됐으면 테이블 미갱신(원본 src 보존).
 /// 6. **모두 통과한 뒤에만** 파티션 테이블의 시작 LBA 갱신.
 ///
-/// 현재 MBR 만. GPT 는 `NotImplemented`(테이블 §6 CRC/백업헤더 미구현).
+/// MBR primary 및 GPT primary/backup 파티션 테이블을 지원한다.
 #[instrument(skip(checkpoint_path))]
 pub fn move_partition(
     disk_number: u32,
@@ -278,12 +353,99 @@ pub fn move_partition(
     new_start_lba: u64,
     checkpoint_path: &Path,
 ) -> Result<MovePartitionOutcome> {
+    move_partition_with_events_mode(
+        disk_number,
+        src_start_lba,
+        new_start_lba,
+        checkpoint_path,
+        MoveMode::Standard,
+        |_| {},
+    )
+}
+
+pub fn move_partition_offline_system<P>(
+    disk_number: u32,
+    src_start_lba: u64,
+    new_start_lba: u64,
+    checkpoint_partition_start_lba: u64,
+    source_drive_letter: &str,
+    checkpoint_path: &Path,
+    on_event: P,
+) -> Result<MovePartitionOutcome>
+where
+    P: FnMut(MoveEvent),
+{
+    let _volume_lock = VolumeLock::lock_and_dismount(source_drive_letter)?;
+    move_partition_with_events_mode(
+        disk_number,
+        src_start_lba,
+        new_start_lba,
+        checkpoint_path,
+        MoveMode::OfflineSystem {
+            checkpoint_partition_start_lba,
+        },
+        on_event,
+    )
+}
+
+pub fn patch_ntfs_boot_metadata_offline(
+    disk_number: u32,
+    old_start_lba: u64,
+    new_start_lba: u64,
+    length_sectors: u64,
+) -> Result<()> {
+    safety::require_offline_system_move()?;
+    let disk = open_writable(disk_number)?;
+    ntfs_boot::update_hidden_sectors(&disk, old_start_lba, new_start_lba, length_sectors)
+}
+
+#[doc(hidden)]
+pub fn move_partition_with_events<P>(
+    disk_number: u32,
+    src_start_lba: u64,
+    new_start_lba: u64,
+    checkpoint_path: &Path,
+    on_event: P,
+) -> Result<MovePartitionOutcome>
+where
+    P: FnMut(MoveEvent),
+{
+    move_partition_with_events_mode(
+        disk_number,
+        src_start_lba,
+        new_start_lba,
+        checkpoint_path,
+        MoveMode::Standard,
+        on_event,
+    )
+}
+
+fn move_partition_with_events_mode<P>(
+    disk_number: u32,
+    src_start_lba: u64,
+    new_start_lba: u64,
+    checkpoint_path: &Path,
+    mode: MoveMode,
+    mut on_event: P,
+) -> Result<MovePartitionOutcome>
+where
+    P: FnMut(MoveEvent),
+{
     safety::require_v2_destructive()?;
+    if matches!(mode, MoveMode::OfflineSystem { .. }) {
+        safety::require_offline_system_move()?;
+    }
 
     let disk = open_writable(disk_number)?; // 알파 게이트 + 디스크 가드
     let sector = disk.geometry().logical_sector_bytes as u64;
     if sector == 0 {
         return Err(ParqError::Platform("논리 섹터 크기 0".into()));
+    }
+    let minimum_start = minimum_partition_start_lba(sector);
+    if new_start_lba < minimum_start {
+        return Err(ParqError::ValidationFailed(format!(
+            "새 시작 LBA {new_start_lba} 는 디스크 예약 영역과 겹칩니다 — 최소 LBA {minimum_start} (1 MiB) 필요"
+        )));
     }
 
     let disks = disk::enumerate()?;
@@ -292,10 +454,25 @@ pub fn move_partition(
         .find(|d| d.number == disk_number)
         .ok_or_else(|| ParqError::DiskNotFound(format!("disk {disk_number}")))?;
 
-    if layout.partition_style != disk::PartitionStyle::Mbr {
-        return Err(ParqError::NotImplemented(
-            "GPT 파티션 테이블 갱신 (현재 MBR 만 지원)",
+    if !matches!(
+        layout.partition_style,
+        disk::PartitionStyle::Mbr | disk::PartitionStyle::Gpt
+    ) {
+        return Err(ParqError::ValidationFailed(
+            "MBR 또는 GPT 파티션 테이블만 이동할 수 있습니다".into(),
         ));
+    }
+
+    if let Some(recovered) = recover_after_table_write(
+        &disk,
+        layout,
+        disk_number,
+        src_start_lba,
+        new_start_lba,
+        checkpoint_path,
+        sector,
+    )? {
+        return Ok(recovered);
     }
 
     let src_part = layout
@@ -306,12 +483,63 @@ pub fn move_partition(
             ParqError::ValidationFailed(format!("시작 LBA {src_start_lba} 인 파티션이 없습니다"))
         })?;
 
-    // 파티션 가드: 부팅/시스템/마운트된 파티션 거부.
-    safety::check_partition_destructive(layout, src_part)?;
+    let excluded_checkpoint_start = match mode {
+        MoveMode::Standard => None,
+        MoveMode::OfflineSystem {
+            checkpoint_partition_start_lba,
+        } => {
+            if checkpoint_partition_start_lba == src_start_lba
+                || !layout.partitions.iter().any(|partition| {
+                    partition.offset_bytes / sector == checkpoint_partition_start_lba
+                })
+            {
+                return Err(ParqError::ValidationFailed(
+                    "오프라인 checkpoint 파티션이 대상 디스크의 별도 파티션으로 확인되지 않습니다"
+                        .into(),
+                ));
+            }
+            Some(checkpoint_partition_start_lba)
+        }
+    };
+
+    let start_state = match layout.partition_style {
+        disk::PartitionStyle::Mbr => {
+            partition_table::read_start_state_mbr(&disk, src_start_lba, new_start_lba)?
+        }
+        disk::PartitionStyle::Gpt => {
+            partition_table::read_start_state_gpt(&disk, src_start_lba, new_start_lba)?
+        }
+        _ => unreachable!("partition style validated above"),
+    };
+    match start_state {
+        partition_table::StartState::Old => {}
+        partition_table::StartState::New => {
+            return Err(ParqError::ValidationFailed(
+                "파티션 엔트리가 이미 새 시작 위치를 가리킵니다 — 복구 checkpoint 없이 이동할 수 없습니다"
+                    .into(),
+            ))
+        }
+        partition_table::StartState::Both | partition_table::StartState::Missing => {
+            return Err(ParqError::ValidationFailed(
+                "대상 파티션 엔트리를 old 위치에서 유일하게 확인할 수 없습니다"
+                    .into(),
+            ))
+        }
+    }
+
+    match mode {
+        MoveMode::Standard => safety::check_partition_destructive(layout, src_part)?,
+        MoveMode::OfflineSystem { .. } => {
+            safety::check_partition_offline_system_move_lockable(layout, src_part)?
+        }
+    }
 
     let length_sectors = src_part.size_bytes / sector;
     if length_sectors == 0 {
         return Err(ParqError::ValidationFailed("파티션 길이가 0".into()));
+    }
+    if matches!(mode, MoveMode::OfflineSystem { .. }) {
+        ntfs_boot::validate_move_source(&disk, src_start_lba, new_start_lba, length_sectors)?;
     }
 
     // dst 가 다른 파티션과 겹치지 않는지(자기 자신은 겹침 허용 — overlap 이동).
@@ -331,14 +559,26 @@ pub fn move_partition(
     }
 
     // 인접 파티션 무변경 스냅샷 (charter §3-6).
-    let adjacent_before = hash_others(&disk, layout, src_start_lba, sector)?;
+    let adjacent_before = hash_others(
+        &disk,
+        layout,
+        src_start_lba,
+        excluded_checkpoint_start,
+        sector,
+    )?;
 
     // 데이터 이동 (checkpoint + 라운드트립).
     let plan = plan_move(disk_number, src_start_lba, new_start_lba, length_sectors)?;
-    let data = execute_move(&plan, checkpoint_path, |_, _| {})?;
+    let data = execute_move_with_events(&plan, checkpoint_path, &mut on_event)?;
 
     // 인접 무변경 재확인.
-    let adjacent_after = hash_others(&disk, layout, src_start_lba, sector)?;
+    let adjacent_after = hash_others(
+        &disk,
+        layout,
+        src_start_lba,
+        excluded_checkpoint_start,
+        sector,
+    )?;
     if adjacent_before != adjacent_after {
         return Err(ParqError::ValidationFailed(
             "인접 파티션이 변경되었습니다! 파티션 테이블을 갱신하지 않았고 원본은 src 에 \
@@ -348,7 +588,49 @@ pub fn move_partition(
     }
 
     // 데이터/무결성/인접 검증 모두 통과 → 파티션 테이블 갱신.
-    partition_table::update_partition_start_mbr(&disk, src_start_lba, new_start_lba)?;
+    let mut checkpoint = load_checkpoint(checkpoint_path)?
+        .ok_or_else(|| ParqError::Transaction("이동 checkpoint 가 없습니다".into()))?;
+    checkpoint.phase = match layout.partition_style {
+        disk::PartitionStyle::Gpt => "table_update_backup",
+        _ => "table_update",
+    }
+    .into();
+    write_checkpoint(checkpoint_path, &checkpoint)?;
+    on_event(MoveEvent::BeforeTableWrite);
+    match layout.partition_style {
+        disk::PartitionStyle::Mbr => partition_table::update_partition_start_mbr_with_hook(
+            &disk,
+            src_start_lba,
+            new_start_lba,
+            || on_event(MoveEvent::AfterTableWriteFlushed),
+        )?,
+        disk::PartitionStyle::Gpt => partition_table::update_partition_start_gpt_with_hook(
+            &disk,
+            src_start_lba,
+            new_start_lba,
+            |stage| {
+                let (phase, event) = match stage {
+                    partition_table::GptWriteStage::Backup => {
+                        ("table_update_primary", MoveEvent::AfterGptBackupFlushed)
+                    }
+                    partition_table::GptWriteStage::PrimaryEntries => (
+                        "table_update_primary_header",
+                        MoveEvent::AfterGptPrimaryEntriesFlushed,
+                    ),
+                    partition_table::GptWriteStage::Complete => {
+                        ("table_update_complete", MoveEvent::AfterTableWriteFlushed)
+                    }
+                };
+                checkpoint.phase = phase.into();
+                write_checkpoint(checkpoint_path, &checkpoint)?;
+                on_event(event);
+                Ok(())
+            },
+        )?,
+        _ => unreachable!("partition style validated above"),
+    }
+    checkpoint.phase = "done".into();
+    write_checkpoint(checkpoint_path, &checkpoint)?;
 
     info!(
         target: "parq::move",
@@ -366,18 +648,156 @@ pub fn move_partition(
     })
 }
 
+fn recover_after_table_write(
+    disk: &WritableDisk,
+    layout: &disk::Disk,
+    disk_number: u32,
+    src_start_lba: u64,
+    new_start_lba: u64,
+    checkpoint_path: &Path,
+    sector: u64,
+) -> Result<Option<MovePartitionOutcome>> {
+    let Some(checkpoint) = load_checkpoint(checkpoint_path)? else {
+        return Ok(None);
+    };
+    if checkpoint.log_format_version != 2
+        || checkpoint.plan.disk_number != disk_number
+        || checkpoint.plan.src_lba != src_start_lba
+        || checkpoint.plan.dst_lba != new_start_lba
+    {
+        return Ok(None);
+    }
+    if !checkpoint.phase.starts_with("table_update") && checkpoint.phase != "done" {
+        return Ok(None);
+    }
+    let start_state = match layout.partition_style {
+        disk::PartitionStyle::Mbr => {
+            partition_table::read_start_state_mbr(disk, src_start_lba, new_start_lba)?
+        }
+        disk::PartitionStyle::Gpt => {
+            partition_table::read_start_state_gpt_recovery(disk, src_start_lba, new_start_lba)?
+        }
+        _ => return Ok(None),
+    };
+
+    if layout.partition_style == disk::PartitionStyle::Gpt {
+        if start_state == partition_table::StartState::Missing {
+            return Err(ParqError::ValidationFailed(
+                "GPT 이동 복구 중 old/new 시작 엔트리를 찾을 수 없습니다".into(),
+            ));
+        }
+        partition_table::update_partition_start_gpt_with_hook(
+            disk,
+            src_start_lba,
+            new_start_lba,
+            |_| Ok(()),
+        )?;
+        return finish_table_write_recovery(
+            disk,
+            layout,
+            disk_number,
+            src_start_lba,
+            new_start_lba,
+            checkpoint_path,
+            sector,
+            checkpoint,
+        )
+        .map(Some);
+    }
+
+    match start_state {
+        partition_table::StartState::Old => Ok(None),
+        partition_table::StartState::Both | partition_table::StartState::Missing => {
+            Err(ParqError::ValidationFailed(
+                "MBR 이동 복구 중 old/new 시작 엔트리 상태가 모호합니다".into(),
+            ))
+        }
+        partition_table::StartState::New => finish_table_write_recovery(
+            disk,
+            layout,
+            disk_number,
+            src_start_lba,
+            new_start_lba,
+            checkpoint_path,
+            sector,
+            checkpoint,
+        )
+        .map(Some),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_table_write_recovery(
+    disk: &WritableDisk,
+    layout: &disk::Disk,
+    disk_number: u32,
+    src_start_lba: u64,
+    new_start_lba: u64,
+    checkpoint_path: &Path,
+    sector: u64,
+    mut checkpoint: Checkpoint,
+) -> Result<MovePartitionOutcome> {
+    let expected = checkpoint
+        .src_sha256
+        .clone()
+        .ok_or_else(|| ParqError::Transaction("checkpoint 에 src_sha256 없음".into()))?;
+    let actual = hash_region(
+        disk,
+        new_start_lba,
+        checkpoint.plan.length_sectors,
+        checkpoint.chunk_sectors,
+        sector,
+    )?;
+    if actual != expected {
+        return Err(ParqError::ValidationFailed(format!(
+            "파티션 테이블 갱신 후 복구 해시 불일치: expected={expected}, actual={actual}"
+        )));
+    }
+    disk.update_properties()?;
+    checkpoint.phase = "done".into();
+    write_checkpoint(checkpoint_path, &checkpoint)?;
+    let partition_id = layout
+        .partitions
+        .iter()
+        .find(|partition| {
+            let start = partition.offset_bytes / sector;
+            start == src_start_lba || start == new_start_lba
+        })
+        .map(|partition| partition.id.clone())
+        .unwrap_or_else(|| format!("disk{disk_number}-moved"));
+    info!(
+        target: "parq::move",
+        src_start_lba,
+        new_start_lba,
+        "파티션 테이블 write 이후 checkpoint 복구 완료"
+    );
+    Ok(MovePartitionOutcome {
+        data: MoveOutcome {
+            sha256: actual,
+            chunks: checkpoint.chunks_total,
+            direction: checkpoint.plan.direction,
+            resumed: true,
+        },
+        partition_id,
+        old_start_lba: src_start_lba,
+        new_start_lba,
+        length_sectors: checkpoint.plan.length_sectors,
+    })
+}
+
 /// 이동 대상(exclude_start_lba)을 뺀 나머지 파티션들의 (id, SHA256) 목록. 정렬. 인접 무변경 검증용.
 fn hash_others(
     disk: &WritableDisk,
     layout: &disk::Disk,
     exclude_start_lba: u64,
+    exclude_checkpoint_start_lba: Option<u64>,
     sector: u64,
 ) -> Result<Vec<(String, String)>> {
     let chunk_sectors = (CHUNK_BYTES / sector).max(1);
     let mut out = Vec::new();
     for p in &layout.partitions {
         let p_start = p.offset_bytes / sector;
-        if p_start == exclude_start_lba {
+        if p_start == exclude_start_lba || exclude_checkpoint_start_lba == Some(p_start) {
             continue;
         }
         let p_len = p.size_bytes / sector;
@@ -410,7 +830,11 @@ fn hash_region(
         hasher.update(&slice[..]);
         off += n;
     }
-    Ok(hasher.finalize().iter().map(|b| format!("{b:02x}")).collect())
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect())
 }
 
 fn load_checkpoint(path: &Path) -> Result<Option<Checkpoint>> {
@@ -467,6 +891,36 @@ mod tests {
     }
 
     #[test]
+    fn overlap_chunk_never_exceeds_move_distance() {
+        let plan = MovePlan {
+            disk_number: 1,
+            src_lba: 10_000,
+            dst_lba: 10_128,
+            length_sectors: 4096,
+            direction: Direction::Backward,
+        };
+        assert_eq!(choose_chunk_sectors(&plan, 2048), 128);
+    }
+
+    #[test]
+    fn non_overlap_keeps_base_chunk_size() {
+        let plan = MovePlan {
+            disk_number: 1,
+            src_lba: 10_000,
+            dst_lba: 20_000,
+            length_sectors: 4096,
+            direction: Direction::Forward,
+        };
+        assert_eq!(choose_chunk_sectors(&plan, 2048), 2048);
+    }
+
+    #[test]
+    fn partition_start_reserves_first_mib() {
+        assert_eq!(minimum_partition_start_lba(512), 2048);
+        assert_eq!(minimum_partition_start_lba(4096), 256);
+    }
+
+    #[test]
     fn chunk_at_forward_covers_all() {
         // length 10 sectors, chunk 4 → chunks: [0..4),[4..8),[8..10)
         let total = 10u64.div_ceil(4);
@@ -479,7 +933,7 @@ mod tests {
     #[test]
     fn chunk_at_backward_covers_all_from_end() {
         let total = 10u64.div_ceil(4); // 3
-        // backward: i=0 → 마지막 물리 청크(offset 8, 2섹터), i=2 → 첫 청크
+                                       // backward: i=0 → 마지막 물리 청크(offset 8, 2섹터), i=2 → 첫 청크
         assert_eq!(chunk_at(0, total, 10, 4, Direction::Backward), (8, 2));
         assert_eq!(chunk_at(1, total, 10, 4, Direction::Backward), (4, 4));
         assert_eq!(chunk_at(2, total, 10, 4, Direction::Backward), (0, 4));

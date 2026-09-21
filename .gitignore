@@ -39,3 +39,4 @@ yarn-error.log*
 *.vhd
 *.vhdx
 parq-test*
+test-vhds/

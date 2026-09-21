@@ -2,7 +2,7 @@
 // ⚠ 파티션 데이터 + MBR 테이블을 바꾼다. 실제 데이터 디스크에 쓰지 말 것.
 //
 //   $env:PARQ_ENABLE_V2_DESTRUCTIVE=1; $env:PARQ_DEV_ALLOW_INTERNAL_DISKS=1
-//   cargo run --example move_part -- <disk> <max_bytes> <src_start_lba> <new_start_lba> <ckpt>
+//   cargo run --example move_part -- <disk> <max_bytes> <src_start_lba> <new_start_lba> <ckpt> [kill_phase]
 //
 // 안전장치: move_partition 내부의 알파게이트+디스크가드+파티션가드(부팅/시스템/마운트 거부)
 //   + dst free 검증 + 인접 무변경 검증. 여기 추가로 크기 상한(max_bytes) 가드.
@@ -23,20 +23,65 @@ fn main() {
     let src: u64 = a[3].parse().unwrap();
     let dst: u64 = a[4].parse().unwrap();
     let ckpt = PathBuf::from(&a[5]);
+    let kill_phase = a.get(6).map(String::as_str);
+    if kill_phase.is_some_and(|phase| {
+        !matches!(
+            phase,
+            "before_table_write"
+                | "after_gpt_backup"
+                | "after_gpt_primary_entries"
+                | "after_table_write"
+        )
+    }) {
+        eprintln!("지원하지 않는 kill_phase 입니다");
+        std::process::exit(2);
+    }
 
     // 크기 상한 가드 (read-only open 으로 확인).
     if let Ok(rd) = raw_io::open_physical_drive_readonly(disk) {
         if rd.geometry().total_bytes > max_bytes {
-            eprintln!("가드 중단: 디스크 크기 {} > 상한 {max_bytes}", rd.geometry().total_bytes);
+            eprintln!(
+                "가드 중단: 디스크 크기 {} > 상한 {max_bytes}",
+                rd.geometry().total_bytes
+            );
             std::process::exit(1);
         }
     }
 
-    match move_engine::move_partition(disk, src, dst, &ckpt) {
+    let events = |event: move_engine::MoveEvent| match event {
+        move_engine::MoveEvent::BeforeTableWrite if kill_phase == Some("before_table_write") => {
+            eprintln!("[KILL] partition table write 직전 abort");
+            std::process::abort();
+        }
+        move_engine::MoveEvent::AfterGptBackupFlushed if kill_phase == Some("after_gpt_backup") => {
+            eprintln!("[KILL] backup GPT write+flush 직후 abort");
+            std::process::abort();
+        }
+        move_engine::MoveEvent::AfterGptPrimaryEntriesFlushed
+            if kill_phase == Some("after_gpt_primary_entries") =>
+        {
+            eprintln!("[KILL] primary GPT entries write+flush 직후 abort");
+            std::process::abort();
+        }
+        move_engine::MoveEvent::AfterTableWriteFlushed
+            if kill_phase == Some("after_table_write") =>
+        {
+            eprintln!("[KILL] partition table write+flush 직후 abort");
+            std::process::abort();
+        }
+        _ => {}
+    };
+
+    match move_engine::move_partition_with_events(disk, src, dst, &ckpt, events) {
         Ok(o) => {
             println!(
                 "[PASS] 파티션 이동 완료: id={} {}→{} len={} sha256={} (resumed={})",
-                o.partition_id, o.old_start_lba, o.new_start_lba, o.length_sectors, o.data.sha256, o.data.resumed
+                o.partition_id,
+                o.old_start_lba,
+                o.new_start_lba,
+                o.length_sectors,
+                o.data.sha256,
+                o.data.resumed
             );
         }
         Err(e) => {

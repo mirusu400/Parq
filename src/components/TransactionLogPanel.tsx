@@ -56,10 +56,17 @@ function resultBadge(result: string | null) {
       </span>
     );
   }
+  if (result.startsWith("failed")) {
+    return (
+      <span className="rounded border border-red-700 bg-red-950/40 px-1.5 py-0.5 text-[11px] text-red-300">
+        failed
+      </span>
+    );
+  }
   if (result.startsWith("rolled_back")) {
     return (
       <span className="rounded border border-red-700 bg-red-950/40 px-1.5 py-0.5 text-[11px] text-red-300">
-        rolled back
+        legacy rolled back
       </span>
     );
   }

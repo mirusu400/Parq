@@ -36,13 +36,14 @@ fn main() {
         println!("  id={} serial={:?}", d.id, d.serial);
         for p in &d.partitions {
             println!(
-                "  Part #{} offset={:>13} size={:>13} letter={:?} fs={:?} label={:?} boot={} sys={} hidden={} in_use={}",
+                "  Part #{} offset={:>13} size={:>13} letter={:?} fs={:?} label={:?} bitlocker={:?} boot={} sys={} hidden={} in_use={}",
                 p.index,
                 p.offset_bytes,
                 p.size_bytes,
                 p.drive_letter,
                 p.file_system,
                 p.label,
+                p.bitlocker_status,
                 p.is_boot,
                 p.is_system,
                 p.is_hidden,

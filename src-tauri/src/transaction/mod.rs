@@ -1,6 +1,6 @@
-// 트랜잭션 로그 / 롤백.
+// 트랜잭션 실행 감사 로그.
 //
-// 모든 파괴적 작업은 begin → run_step → commit | rollback 흐름을 따른다.
+// 모든 파괴적 작업은 begin → run_step → commit | fail 흐름을 따른다.
 // 로그는 `%LOCALAPPDATA%\Parq\transactions\<id>.json` 에 fsync 로 기록한다.
 // 크래시 후 재시작 시 `result == None` 인 로그를 찾아 사용자에게 보고할 수 있다 (V2 에서 구현).
 //
@@ -69,13 +69,13 @@ pub struct TransactionLog {
     pub plan_summary: String,
     pub steps: Vec<Step>,
     pub ended_at_unix_nanos: Option<u128>,
-    /// 종료 결과. `"committed"` / `"rolled_back: <reason>"` / `"dropped_without_finalize"` 등.
+    /// 종료 결과. `"committed"` / `"failed: <reason>"` / `"dropped_without_finalize"` 등.
     pub result: Option<String>,
 }
 
 /// 진행 중인 트랜잭션 핸들.
 ///
-/// `commit` 또는 `rollback` 으로 끝내야 한다. 둘 다 호출하지 않은 채 drop 되면 로그가
+/// `commit` 또는 `fail` 로 끝내야 한다. 둘 다 호출하지 않은 채 drop 되면 로그가
 /// `dropped_without_finalize` 로 마감되어 디스크에 흔적이 남는다 (best-effort fsync).
 pub struct Transaction {
     log_path: PathBuf,
@@ -141,14 +141,14 @@ impl Transaction {
         Ok(())
     }
 
-    /// 트랜잭션을 롤백으로 마감. `reason` 은 사람이 읽을 메시지 (보통 에러 출처).
+    /// 작업 실패를 기록하고 마감한다. 디스크 상태를 되돌리는 보상 작업은 수행하지 않는다.
     #[instrument(skip(self), fields(txn_id = %self.log.id))]
-    pub fn rollback(mut self, reason: &str) -> Result<()> {
+    pub fn fail(mut self, reason: &str) -> Result<()> {
         self.log.ended_at_unix_nanos = Some(now_unix_nanos());
-        self.log.result = Some(format!("rolled_back: {reason}"));
+        self.log.result = Some(format!("failed: {reason}"));
         self.write_to_disk()?;
         self.finalized = true;
-        warn!(target: "parq::transaction", id = %self.log.id, %reason, "rolled back");
+        warn!(target: "parq::transaction", id = %self.log.id, %reason, "operation failed");
         Ok(())
     }
 
@@ -198,7 +198,7 @@ impl Drop for Transaction {
                 warn!(
                     target: "parq::transaction",
                     id = %self.log.id,
-                    "commit/rollback 없이 drop 됨 — 로그를 dropped_without_finalize 로 마감"
+                    "commit/fail 없이 drop 됨 — 로그를 dropped_without_finalize 로 마감"
                 );
             }
         }
@@ -428,7 +428,7 @@ mod tests {
             .expect("detail")
             .contains("의도적 실패"));
 
-        txn.rollback("의도적 실패").expect("rollback");
+        txn.fail("의도적 실패").expect("fail");
     }
 
     #[test]
@@ -446,17 +446,17 @@ mod tests {
     }
 
     #[test]
-    fn rollback_finalizes_with_reason() {
+    fn fail_finalizes_with_reason() {
         let _guard = ENV_LOCK.lock().unwrap();
-        let _dir = TempTxnDir::new("rollback");
+        let _dir = TempTxnDir::new("fail");
         let txn = begin(sample_params()).expect("begin");
         let log_path = txn.log_path().to_path_buf();
 
-        txn.rollback("디스크가 사라짐").expect("rollback");
+        txn.fail("디스크가 사라짐").expect("fail");
 
         let log = read_log(&log_path);
         let result = log.result.expect("result");
-        assert!(result.starts_with("rolled_back: "));
+        assert!(result.starts_with("failed: "));
         assert!(result.contains("디스크가 사라짐"));
         assert!(log.ended_at_unix_nanos.is_some());
     }
@@ -469,7 +469,7 @@ mod tests {
         let log_path = {
             let txn = begin(sample_params()).expect("begin");
             txn.log_path().to_path_buf()
-            // txn drops here without commit/rollback
+            // txn drops here without commit/fail
         };
 
         let log = read_log(&log_path);

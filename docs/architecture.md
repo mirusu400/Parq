@@ -30,7 +30,7 @@
                          ▼
               ┌──────────────────────────┐
               │ transaction/             │
-              │ - begin / commit / rollback
+              │ - begin / commit / fail audit logging
               │ - %LOCALAPPDATA%\Parq\transactions\<uuid>.json
               └────────────┬─────────────┘
                            ▼

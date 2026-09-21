@@ -88,7 +88,7 @@ harness (test-only binary, VHD 대상):
 - `copying` 청크 경계 직후 (커서 기록 후)
 - `copying` 청크 중간 (데이터 flush 전)
 - **데이터 flush 후 / 커서 기록 전** (§3 순서의 3↔4 사이 — 멱등 재쓰기 검증의 핵심)
-- `table_update` 진입 직후
+- MBR `table_update` 진입 직후 / 테이블 sector write+flush 직후
 - GPT: backup 갱신 후 / primary 갱신 전 (move §6)
 
 각 트리거 × VHD 케이스(overlap/방향/섹터/스타일) = kill-test 매트릭스. **전부 PASS 여야 Phase 3
@@ -137,7 +137,15 @@ harness (test-only binary, VHD 대상):
 - [x] kill-test 하네스 Rust binary (§3) — `examples/kill_test.rs`. mock 이동(일반 파일 청크복사
       +checkpoint)으로 자체 검증: 5 시나리오(no-kill / kill@{0,7,15} × before_cursor·after_cursor)
       모두 재시작→복구→byte-exact PASS. *(2026-07-09. 실제 이동 연결은 Phase 3.)*
-- [ ] 통합 테스트 VHD lifecycle 자동화 (§4)
+- [x] 실제 VHD kill-test 하네스 — `scripts/actual-vhd-kill-test.ps1`. Hyper-V 모듈 없이 `diskpart`로
+      64 MiB 파일 기반 VHD를 생성·검증·분리하고, MBR/GPT 파티션의 non-overlap / 마지막 청크 경계 /
+      overlap-left(forward) / overlap-right(backward), flush 후 checkpoint 전의 작은 overlap 양방향,
+      table write 직전 / write+flush 직후 강제 종료→재개→테이블 갱신을 검증한다. GPT에서는 backup
+      write 직후와 primary 엔트리 write 직후도 추가 검증한다. MBR 8개, GPT 10개 kill/resume와
+      LBA 0 예약 영역 무쓰기 거부가 모두 독립 PowerShell SHA256 + Windows 재열거 PASS.
+      *(2026-09-16, VMware VM.)*
+- [x] 통합 테스트 VHD lifecycle 자동화 (§4) — 위 실제 VHD 하네스에서 생성→attach→대상 검증→
+      테스트→finally detach 전 과정을 자동화. 현재 512-byte sector + MBR/GPT 범위.
 - [ ] CI 잡 정의 (§5) — self-hosted 러너 셋업 문서 포함
 
 **전부 non-destructive/read-only 또는 VHD-only 이므로 charter §4 Phase 1 규칙(‘read-only /

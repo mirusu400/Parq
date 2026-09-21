@@ -45,17 +45,11 @@
 
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $true)]
-    [ValidateRange(0, [int]::MaxValue)]
-    [int]$DiskNumber,
+    [int]$DiskNumber = -1,
 
-    [Parameter(Mandatory = $true)]
-    [ValidateRange(0, [long]::MaxValue)]
-    [long]$StartLba,
+    [long]$StartLba = -1,
 
-    [Parameter(Mandatory = $true)]
-    [ValidateRange(1, [long]::MaxValue)]
-    [long]$LengthSectors,
+    [long]$LengthSectors = 0,
 
     [ValidateSet(512, 4096)]
     [int]$SectorSize = 0,
@@ -161,6 +155,9 @@ function Get-RawRegionHash {
 
 # 스크립트로 직접 실행됐을 때만 CLI 로 동작 (dot-source 시엔 함수만 로드)
 if ($MyInvocation.InvocationName -ne '.') {
+    if ($DiskNumber -lt 0 -or $StartLba -lt 0 -or $LengthSectors -lt 1) {
+        throw "DiskNumber, StartLba, LengthSectors 를 지정해야 합니다."
+    }
     $result = Get-RawRegionHash -DiskNumber $DiskNumber -StartLba $StartLba `
         -LengthSectors $LengthSectors -SectorSize $SectorSize
     if ($AsObject) {

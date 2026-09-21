@@ -24,6 +24,11 @@ export type FileSystemKind =
   | "EFI"
   | "Unknown";
 
+export type BitLockerStatus =
+  | "NotEncrypted"
+  | "Encrypted"
+  | "Unknown";
+
 export interface Disk {
   /** 안정적인 식별자 (시리얼 또는 디스크 ID). 디스크 번호는 매번 바뀌므로 사용 금지. */
   id: string;
@@ -53,6 +58,7 @@ export interface Partition {
   isBoot: boolean;
   isSystem: boolean;
   isHidden: boolean;
+  bitlockerStatus: BitLockerStatus;
   /** 마운트되어 사용 중이면 true — V1 에서 쓰기 작업 차단의 1차 신호. */
   isInUse: boolean;
 }
@@ -156,6 +162,6 @@ export interface TransactionLog {
   plan_summary: string;
   steps: TransactionStep[];
   ended_at_unix_nanos: number | null;
-  /** "committed" | "rolled_back: ..." | "dropped_without_finalize" | null (in-progress) */
+  /** "committed" | "failed: ..." | legacy "rolled_back: ..." | "dropped_without_finalize" | null */
   result: string | null;
 }
