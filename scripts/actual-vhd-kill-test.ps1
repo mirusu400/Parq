@@ -174,6 +174,53 @@ function Invoke-TableKillResumeMove {
     Write-Host "[PASS] $Name" -ForegroundColor Green
 }
 
+function Assert-ChangedCheckpointRejectedWithoutWrites {
+    param(
+        [Parameter(Mandatory)][int]$DiskNumber,
+        [Parameter(Mandatory)][long]$SourceLba,
+        [Parameter(Mandatory)][long]$DestinationLba,
+        [Parameter(Mandatory)][string]$CheckpointPath,
+        [Parameter(Mandatory)][string]$ExpectedSourceSha256,
+        [Parameter(Mandatory)][string]$RawWriteExe,
+        [Parameter(Mandatory)][string]$MoveRegionExe
+    )
+
+    Remove-TestDriveLetter -DiskNumber $DiskNumber
+    & $MoveRegionExe $DiskNumber $MaxGuardBytes $SourceLba $DestinationLba `
+        $PartitionLengthSectors $CheckpointPath 4 after_cursor
+    if ($LASTEXITCODE -eq 0) {
+        throw "changed-checkpoint guard: kill 지점에서 프로세스가 종료되지 않았습니다."
+    }
+
+    & $RawWriteExe $DiskNumber $MaxGuardBytes $DestinationLba 1
+    if ($LASTEXITCODE -ne 0) {
+        throw "changed-checkpoint guard: 목적지 변조 실패"
+    }
+
+    $unionStart = [Math]::Min($SourceLba, $DestinationLba)
+    $unionEnd = [Math]::Max(
+        $SourceLba + $PartitionLengthSectors,
+        $DestinationLba + $PartitionLengthSectors
+    )
+    $before = Get-RawRegionHash -DiskNumber $DiskNumber -StartLba $unionStart `
+        -LengthSectors ($unionEnd - $unionStart) -SectorSize $TestSectorSize
+
+    & $MoveRegionExe $DiskNumber $MaxGuardBytes $SourceLba $DestinationLba `
+        $PartitionLengthSectors $CheckpointPath
+    if ($LASTEXITCODE -eq 0) {
+        throw "changed-checkpoint guard: 변경된 snapshot 재개가 거부되지 않았습니다."
+    }
+
+    $after = Get-RawRegionHash -DiskNumber $DiskNumber -StartLba $unionStart `
+        -LengthSectors ($unionEnd - $unionStart) -SectorSize $TestSectorSize
+    if ($after.Sha256 -ne $before.Sha256) {
+        throw "changed-checkpoint guard: 거부된 재개가 디스크 데이터를 변경했습니다."
+    }
+    Assert-MovedPartition -DiskNumber $DiskNumber -ExpectedStartLba $SourceLba `
+        -ExpectedSha256 $ExpectedSourceSha256
+    Write-Host "[PASS] changed checkpoint rejected before additional writes" -ForegroundColor Green
+}
+
 function Assert-ReservedRegionRejected {
     param(
         [Parameter(Mandatory)][int]$DiskNumber,
@@ -323,7 +370,13 @@ try {
         -CheckpointPath (Join-Path $checkpointDir "reserved-region-rejected.json") `
         -ExpectedSha256 $seedHash.Sha256 -MovePartExe $movePartExe
 
-    Write-Host "`nactual $PartitionStyle VHD test: $scenarioCount kill/resume + 1 reserved-region guard passed, 0 failed" -ForegroundColor Green
+    Assert-ChangedCheckpointRejectedWithoutWrites -DiskNumber $diskNumber `
+        -SourceLba 65536 -DestinationLba 57344 `
+        -CheckpointPath (Join-Path $checkpointDir "changed-checkpoint.json") `
+        -ExpectedSourceSha256 $seedHash.Sha256 -RawWriteExe $rawWriteExe `
+        -MoveRegionExe $moveRegionExe
+
+    Write-Host "`nactual $PartitionStyle VHD test: $scenarioCount kill/resume + 2 guards passed, 0 failed" -ForegroundColor Green
     Write-Host "VHD: $vhdPath"
     Write-Host "SHA256: $($seedHash.Sha256)"
 }
