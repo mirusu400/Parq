@@ -88,6 +88,18 @@ fn chunk_at(
     (offset, size)
 }
 
+fn physical_chunk_was_copied(
+    physical_chunk: u64,
+    chunks_total: u64,
+    chunks_done: u64,
+    direction: Direction,
+) -> bool {
+    match direction {
+        Direction::Forward => physical_chunk < chunks_done,
+        Direction::Backward => physical_chunk >= chunks_total.saturating_sub(chunks_done),
+    }
+}
+
 /// 이동 계획 (read-only 로 계산).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MovePlan {
@@ -245,6 +257,11 @@ where
     // src SHA256 를 write 이전에 확정 (charter §3-7 라운드트립 기준값).
     // 겹침 이동에서 src 가 부분 훼손되기 전에 반드시 계산돼야 하므로 첫 write 전에.
     if cp.src_sha256.is_none() {
+        if cp.chunks_done != 0 {
+            return Err(ParqError::ValidationFailed(
+                "checkpoint has copied chunks but no source SHA-256".into(),
+            ));
+        }
         let sha = hash_region(
             &disk,
             plan.src_lba,
@@ -254,6 +271,25 @@ where
         )?;
         cp.src_sha256 = Some(sha);
         write_checkpoint(checkpoint_path, &cp)?;
+    }
+
+    if resumed {
+        let expected = cp
+            .src_sha256
+            .as_deref()
+            .ok_or_else(|| ParqError::Transaction("checkpoint has no source SHA-256".into()))?;
+        let reconstructed = hash_reconstructed_snapshot(&disk, &cp, sector)?;
+        if reconstructed != expected {
+            return Err(ParqError::ValidationFailed(format!(
+                "checkpoint snapshot changed since the previous run: expected={expected}, reconstructed={reconstructed}. No additional data was written; discard this checkpoint and start from a known-good filesystem state"
+            )));
+        }
+        info!(
+            target: "parq::move",
+            chunks_done = cp.chunks_done,
+            sha256 = %reconstructed,
+            "checkpoint snapshot validated before resume"
+        );
     }
 
     // 청크 복사 (방향순) — checkpoint write 순서(§3): read → write(+flush) → 커서 기록(+fsync).
@@ -301,9 +337,9 @@ where
     )?;
     if dst_sha != src_sha {
         return Err(ParqError::ValidationFailed(format!(
-            "체크섬 라운드트립 불일치! 이동 실패 — src({src_sha}) != dst({dst_sha}). \
-             원본 데이터는 src LBA {} 에 보존되어 있습니다 (charter §3-7).",
-            plan.src_lba
+            "destination SHA-256 mismatch: expected={src_sha}, actual={dst_sha}. \
+             The partition table was not updated. For an overlapping move, the old source range \
+             is not a complete rollback copy"
         )));
     }
 
@@ -376,7 +412,7 @@ where
     P: FnMut(MoveEvent),
 {
     let _volume_lock = VolumeLock::lock_and_dismount(source_drive_letter)?;
-    move_partition_with_events_mode(
+    let outcome = move_partition_with_events_mode(
         disk_number,
         src_start_lba,
         new_start_lba,
@@ -385,7 +421,10 @@ where
             checkpoint_partition_start_lba,
         },
         on_event,
-    )
+    )?;
+    let disk = open_writable(disk_number)?;
+    ntfs_boot::update_hidden_sectors(&disk, src_start_lba, new_start_lba, outcome.length_sectors)?;
+    Ok(outcome)
 }
 
 pub fn patch_ntfs_boot_metadata_offline(
@@ -393,8 +432,10 @@ pub fn patch_ntfs_boot_metadata_offline(
     old_start_lba: u64,
     new_start_lba: u64,
     length_sectors: u64,
+    source_drive_letter: &str,
 ) -> Result<()> {
     safety::require_offline_system_move()?;
+    let _volume_lock = VolumeLock::lock_and_dismount(source_drive_letter)?;
     let disk = open_writable(disk_number)?;
     ntfs_boot::update_hidden_sectors(&disk, old_start_lba, new_start_lba, length_sectors)
 }
@@ -837,6 +878,37 @@ fn hash_region(
         .collect())
 }
 
+fn hash_reconstructed_snapshot(
+    disk: &WritableDisk,
+    checkpoint: &Checkpoint,
+    sector: u64,
+) -> Result<String> {
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; (checkpoint.chunk_sectors * sector) as usize];
+    for physical_chunk in 0..checkpoint.chunks_total {
+        let offset = physical_chunk * checkpoint.chunk_sectors;
+        let sectors = (checkpoint.plan.length_sectors - offset).min(checkpoint.chunk_sectors);
+        let bytes = (sectors * sector) as usize;
+        let start_lba = if physical_chunk_was_copied(
+            physical_chunk,
+            checkpoint.chunks_total,
+            checkpoint.chunks_done,
+            checkpoint.plan.direction,
+        ) {
+            checkpoint.plan.dst_lba + offset
+        } else {
+            checkpoint.plan.src_lba + offset
+        };
+        disk.read_sectors(start_lba, &mut buffer[..bytes])?;
+        hasher.update(&buffer[..bytes]);
+    }
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
 fn load_checkpoint(path: &Path) -> Result<Option<Checkpoint>> {
     match fs::read_to_string(path) {
         Ok(s) => serde_json::from_str(&s)
@@ -954,6 +1026,29 @@ mod tests {
                 }
             }
             assert!(covered.iter().all(|&c| c), "미커버 섹터 존재 ({dir:?})");
+        }
+    }
+
+    #[test]
+    fn forward_resume_selects_copied_prefix_from_destination() {
+        let selected: Vec<bool> = (0..5)
+            .map(|chunk| physical_chunk_was_copied(chunk, 5, 2, Direction::Forward))
+            .collect();
+        assert_eq!(selected, [true, true, false, false, false]);
+    }
+
+    #[test]
+    fn backward_resume_selects_copied_suffix_from_destination() {
+        let selected: Vec<bool> = (0..5)
+            .map(|chunk| physical_chunk_was_copied(chunk, 5, 2, Direction::Backward))
+            .collect();
+        assert_eq!(selected, [false, false, false, true, true]);
+    }
+
+    #[test]
+    fn completed_resume_selects_every_chunk_from_destination() {
+        for direction in [Direction::Forward, Direction::Backward] {
+            assert!((0..5).all(|chunk| physical_chunk_was_copied(chunk, 5, 5, direction)));
         }
     }
 }

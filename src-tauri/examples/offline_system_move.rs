@@ -290,20 +290,22 @@ mod windows_main {
                         "이동 결과 길이가 offline state와 다릅니다".into(),
                     ));
                 }
-                state.phase = Phase::PatchingNtfsBoot;
+                state.phase = Phase::Done;
                 write_state(&request.state_path, &state)?;
             }
-            Phase::PatchingNtfsBoot | Phase::Done => {}
+            Phase::PatchingNtfsBoot => {
+                move_engine::patch_ntfs_boot_metadata_offline(
+                    request.disk_number,
+                    request.src_start_lba,
+                    request.new_start_lba,
+                    state.length_sectors,
+                    &source_drive_letter,
+                )?;
+                state.phase = Phase::Done;
+                write_state(&request.state_path, &state)?;
+            }
+            Phase::Done => {}
         }
-
-        move_engine::patch_ntfs_boot_metadata_offline(
-            request.disk_number,
-            request.src_start_lba,
-            request.new_start_lba,
-            state.length_sectors,
-        )?;
-        state.phase = Phase::Done;
-        write_state(&request.state_path, &state)?;
         println!(
             "[PASS] offline Windows partition move complete: disk={} {}→{} len={}",
             request.disk_number, request.src_start_lba, request.new_start_lba, state.length_sectors
