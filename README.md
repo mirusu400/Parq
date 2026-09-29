@@ -29,7 +29,7 @@ Most existing Windows partition tools are bloated with intrusive ads, bundleware
 ### 2. Move & Resize Partitions Safely
 - **Resumable Data Moves**: Move supported offline MBR/GPT data partitions with durable checkpoints and overlap-safe copying.
 - **Integrity Checks & Resume**: Every moved data block is verified with cryptographic checksums. If anything interrupts the process, Parq resumes from a durable checkpoint.
-- **Windows Volume Resize**: Resize NTFS data volumes and the active Windows volume within limits reported by `Get-PartitionSupportedSize`. Active system-partition movement remains an offline-only roadmap item.
+- **Windows Volume Resize**: Resize NTFS data volumes and the active Windows volume within limits reported by `Get-PartitionSupportedSize`. Active system-partition movement has a developer-only WinPE workflow and is not yet integrated into the product UI.
 
 ### 3. Clean, Fast, and 100% Free
 - **No Ads or Bloatware**: No bundled toolbars, trial limitations, or background telemetry services.
@@ -46,6 +46,7 @@ For developers interested in the internal implementation, safety models, and low
 - [safety-model.md](docs/safety-model.md) — Safety guards & system drive protection
 - [v2-charter.md](docs/v2-charter.md) — V2 Move engine charter & safety standards
 - [v2-move-algorithm.md](docs/v2-move-algorithm.md) — Sector migration & checkpoint algorithm
+- [winpe-offline-system-move.md](docs/winpe-offline-system-move.md) — Developer workflow for offline Windows partition moves
 
 ---
 

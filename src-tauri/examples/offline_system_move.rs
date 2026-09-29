@@ -103,6 +103,18 @@ mod windows_main {
         )
     }
 
+    fn preflight_size_state(actual: u64, before: u64, after: u64) -> Result<&'static str> {
+        if actual == after {
+            Ok("ready")
+        } else if actual == before {
+            Ok("before_shrink")
+        } else {
+            Err(ParqError::ValidationFailed(format!(
+                "preflight 원본 크기가 request의 축소 전/후 크기와 모두 다릅니다: actual={actual}, before={before}, after={after}"
+            )))
+        }
+    }
+
     fn validate_disk_fingerprint(request: &Request) -> Result<(u64, disk::Disk)> {
         safety::require_offline_system_move()?;
         let confirmation = std::env::var("PARQ_OFFLINE_CONFIRMATION").unwrap_or_default();
@@ -182,8 +194,12 @@ mod windows_main {
             .ok_or_else(|| {
                 ParqError::ValidationFailed("preflight 원본 파티션을 찾을 수 없습니다".into())
             })?;
-        if source.size_bytes != request.expected_source_size_before
-            || source.file_system != FileSystemKind::Ntfs
+        let size_state = preflight_size_state(
+            source.size_bytes,
+            request.expected_source_size_before,
+            request.expected_source_size_after,
+        )?;
+        if source.file_system != FileSystemKind::Ntfs
             || source.bitlocker_status != BitLockerStatus::NotEncrypted
             || source.is_system
         {
@@ -196,7 +212,7 @@ mod windows_main {
             )));
         }
         println!(
-            "[PASS] preflight: disk={} model={} source={} size={}",
+            "[PASS] preflight: disk={} model={} source={} size={} state={size_state}",
             request.disk_number, target.model, request.src_start_lba, source.size_bytes
         );
         Ok(())
@@ -348,6 +364,19 @@ mod windows_main {
         if let Err(error) = result {
             eprintln!("offline system move 실패: {error}");
             std::process::exit(1);
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::preflight_size_state;
+
+        #[test]
+        fn preflight_accepts_before_and_after_sizes_only() {
+            assert_eq!(preflight_size_state(100, 100, 80).unwrap(), "before_shrink");
+            assert_eq!(preflight_size_state(80, 100, 80).unwrap(), "ready");
+            assert_eq!(preflight_size_state(100, 100, 100).unwrap(), "ready");
+            assert!(preflight_size_state(90, 100, 80).is_err());
         }
     }
 }
