@@ -83,11 +83,8 @@ $checkpointPartition = Get-SingleItem `
     -Items @(Get-Partition -DriveLetter $checkpointLetter -ErrorAction Stop) `
     -Description "$checkpointLetter`: checkpoint partition"
 
-if ($sourcePartition.DiskNumber -ne $checkpointPartition.DiskNumber) {
-    throw "The current offline runner requires a separate checkpoint partition on the target disk."
-}
-if ($sourcePartition.PartitionNumber -eq $checkpointPartition.PartitionNumber) {
-    throw "Source and checkpoint resolve to the same partition."
+if ($sourcePartition.DiskNumber -eq $checkpointPartition.DiskNumber) {
+    throw "The checkpoint volume must be on a different physical disk from the source."
 }
 
 $disk = Get-Disk -Number $sourcePartition.DiskNumber -ErrorAction Stop
@@ -96,6 +93,13 @@ if ([string]$disk.PartitionStyle -ne "GPT") {
 }
 if ($disk.IsReadOnly) {
     throw "The target disk is read-only."
+}
+$checkpointDisk = Get-Disk -Number $checkpointPartition.DiskNumber -ErrorAction Stop
+if ([string]$checkpointDisk.PartitionStyle -ne "GPT") {
+    throw "The checkpoint disk must use GPT."
+}
+if ($checkpointDisk.IsReadOnly -or $checkpointDisk.IsSystem -or $checkpointDisk.IsBoot) {
+    throw "The checkpoint disk must be writable and must not be a Windows system/boot disk."
 }
 
 $sourceVolume = Get-Volume -DriveLetter $sourceLetter -ErrorAction Stop
@@ -107,6 +111,7 @@ if ([string]$checkpointVolume.FileSystem -notin @("NTFS", "FAT32", "exFAT")) {
     throw "The checkpoint volume must use NTFS, FAT32, or exFAT."
 }
 Assert-BitLockerDisabled -DriveLetter $sourceLetter
+Assert-BitLockerDisabled -DriveLetter $checkpointLetter
 
 $sectorSize = [long]$disk.LogicalSectorSize
 if ($sectorSize -le 0) {
@@ -153,10 +158,31 @@ if ([string]::IsNullOrWhiteSpace($serial)) {
     $serial = $null
 }
 
-$checkpointStartLba = [long]$checkpointPartition.Offset / $sectorSize
+$rawCheckpointDisk = Get-SingleItem `
+    -Items @(Get-CimInstance -Namespace "ROOT\Microsoft\Windows\Storage" -ClassName MSFT_Disk |
+        Where-Object { $_.Number -eq $checkpointDisk.Number }) `
+    -Description "checkpoint MSFT_Disk #$($checkpointDisk.Number)"
+$checkpointModel = ([string]$rawCheckpointDisk.Model).Trim()
+if ([string]::IsNullOrWhiteSpace($checkpointModel)) {
+    $checkpointModel = "Unknown"
+}
+$checkpointSerial = ([string]$rawCheckpointDisk.SerialNumber).Trim()
+if ([string]::IsNullOrWhiteSpace($checkpointSerial)) {
+    $checkpointSerial = $null
+}
+
+$checkpointSectorSize = [long]$checkpointDisk.LogicalSectorSize
+if ($checkpointSectorSize -le 0) {
+    throw "The checkpoint disk logical sector size is unavailable."
+}
+if (([long]$checkpointPartition.Offset % $checkpointSectorSize) -ne 0) {
+    throw "The checkpoint partition offset is not sector-aligned."
+}
+$checkpointStartLba = [long]$checkpointPartition.Offset / $checkpointSectorSize
 $sourceStartLba = [long]$sourcePartition.Offset / $sectorSize
 $winPeRoot = "$winPeCheckpointLetter`:\Parq"
 $request = [ordered]@{
+    requestVersion                   = 2
     diskNumber                       = [int]$disk.Number
     expectedDiskSize                 = [long]$disk.Size
     expectedModel                    = $model
@@ -165,7 +191,12 @@ $request = [ordered]@{
     expectedSourceSizeAfter          = $ExpectedSourceSizeAfterBytes
     srcStartLba                      = $sourceStartLba
     newStartLba                      = [long]($NewStartBytes / $sectorSize)
+    checkpointDiskNumber             = [int]$checkpointDisk.Number
+    expectedCheckpointDiskSize       = [long]$checkpointDisk.Size
+    expectedCheckpointModel          = $checkpointModel
+    expectedCheckpointSerial         = $checkpointSerial
     checkpointPartitionStartLba      = $checkpointStartLba
+    expectedCheckpointPartitionSize  = [long]$checkpointPartition.Size
     checkpointPath                   = "$winPeRoot\move-checkpoint.json"
     statePath                        = "$winPeRoot\offline-state.json"
 }
@@ -203,5 +234,5 @@ $confirmation = "MOVE WINDOWS $identity $sourceStartLba $($request.newStartLba)"
 Write-Host "Offline move request created: $outputFullPath" -ForegroundColor Green
 Write-Host "Source: $sourceLetter`: disk=$($disk.Number), LBA=$sourceStartLba, size=$($sourcePartition.Size)"
 Write-Host "Plan: LBA $sourceStartLba -> $($request.newStartLba), size=$ExpectedSourceSizeAfterBytes"
-Write-Host "Checkpoint: partition #$($checkpointPartition.PartitionNumber), WinPE $winPeCheckpointLetter`:"
+Write-Host "Checkpoint: disk=$($checkpointDisk.Number), partition #$($checkpointPartition.PartitionNumber), WinPE $winPeCheckpointLetter`:"
 Write-Host "Confirmation: $confirmation" -ForegroundColor Yellow

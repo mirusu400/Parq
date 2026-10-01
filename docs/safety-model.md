@@ -52,9 +52,10 @@ BitLocker NotEncrypted + writable disk` 조건을 모두 요구한다. EFI/MSR/R
 시스템 볼륨의 시작 LBA 이동은 별도의 개발자용 WinPE 경로만 허용한다. 실제 WinPE 환경
 (`SystemDrive=X:`, `wpeutil.exe`, `MiniNT` 레지스트리)을 모두 확인하고
 `PARQ_ENABLE_V2_DESTRUCTIVE=1`과 `PARQ_ENABLE_OFFLINE_SYSTEM_MOVE=1`이 함께 설정되어야 한다.
-또한 GPT/NTFS, BitLocker 완전 해제, 디스크 크기·모델·시리얼, 원본/대상 LBA, 체크포인트 볼륨
-extent, 강한 확인 문구를 실행 직전에 다시 검증한다. 디스크 번호가 WinPE 부팅 후 달라지면 자동
-추정하지 않고 중단한다. 자세한 운용 절차는 `winpe-offline-system-move.md`를 따른다.
+또한 GPT/NTFS, BitLocker 완전 해제, 대상 및 체크포인트 디스크의 크기·모델·시리얼,
+원본/대상 LBA, 체크포인트 볼륨 extent, 두 디스크의 물리적 분리, 강한 확인 문구를 실행 직전에
+다시 검증한다. 디스크 번호가 WinPE 부팅 후 달라지면 자동 추정하지 않고 중단한다. 자세한 운용
+절차는 `winpe-offline-system-move.md`를 따른다.
 
 검증 실패 시 `ParqError::SystemPartitionProtected`, `ValidationFailed` 등으로 거부. 우회 플래그(`--force`)는 V1에 추가하지 않는다.
 

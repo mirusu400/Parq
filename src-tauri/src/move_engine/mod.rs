@@ -70,6 +70,33 @@ fn minimum_partition_start_lba(sector_bytes: u64) -> u64 {
     PARTITION_DATA_START_BYTES.div_ceil(sector_bytes.max(1))
 }
 
+fn checkpoint_drive_letter(path: &Path) -> Result<char> {
+    let value = path.to_string_lossy();
+    let bytes = value.as_bytes();
+    if bytes.len() < 3
+        || bytes[1] != b':'
+        || !bytes[0].is_ascii_alphabetic()
+        || !matches!(bytes[2], b'\\' | b'/')
+    {
+        return Err(ParqError::ValidationFailed(format!(
+            "checkpoint path must be an absolute drive path: {}",
+            path.display()
+        )));
+    }
+    Ok((bytes[0] as char).to_ascii_uppercase())
+}
+
+fn ensure_checkpoint_on_other_disk(path: &Path, target_disk_number: u32) -> Result<()> {
+    let letter = checkpoint_drive_letter(path)?;
+    let extent = crate::raw_io::volume::query_volume_extent(&letter.to_string())?;
+    if extent.disk_number == target_disk_number {
+        return Err(ParqError::ValidationFailed(
+            "checkpoint volume must be on a different physical disk from the move target".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// 진행 인덱스 `i`(0-based, 방향순) → 영역 시작으로부터의 (섹터 오프셋, 이 청크의 섹터 수).
 /// forward 는 앞에서부터, backward 는 뒤에서부터 물리 청크를 고른다. 나머지 청크는 마지막 물리 청크.
 fn chunk_at(
@@ -196,6 +223,7 @@ where
     P: FnMut(MoveEvent),
 {
     safety::require_v2_destructive()?;
+    ensure_checkpoint_on_other_disk(checkpoint_path, plan.disk_number)?;
 
     // 알파 게이트 + 디스크 가드는 open_writable 안에서 강제된다.
     let disk = open_writable(plan.disk_number)?;
@@ -368,7 +396,7 @@ pub struct MovePartitionOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MoveMode {
     Standard,
-    OfflineSystem { checkpoint_partition_start_lba: u64 },
+    OfflineSystem,
 }
 
 /// **완결된 파티션 이동**: 데이터 이동 + 인접 무변경 검증 + 파티션 테이블 갱신.
@@ -403,7 +431,6 @@ pub fn move_partition_offline_system<P>(
     disk_number: u32,
     src_start_lba: u64,
     new_start_lba: u64,
-    checkpoint_partition_start_lba: u64,
     source_drive_letter: &str,
     checkpoint_path: &Path,
     on_event: P,
@@ -417,9 +444,7 @@ where
         src_start_lba,
         new_start_lba,
         checkpoint_path,
-        MoveMode::OfflineSystem {
-            checkpoint_partition_start_lba,
-        },
+        MoveMode::OfflineSystem,
         on_event,
     )?;
     let disk = open_writable(disk_number)?;
@@ -473,7 +498,7 @@ where
     P: FnMut(MoveEvent),
 {
     safety::require_v2_destructive()?;
-    if matches!(mode, MoveMode::OfflineSystem { .. }) {
+    if mode == MoveMode::OfflineSystem {
         safety::require_offline_system_move()?;
     }
 
@@ -524,25 +549,6 @@ where
             ParqError::ValidationFailed(format!("시작 LBA {src_start_lba} 인 파티션이 없습니다"))
         })?;
 
-    let excluded_checkpoint_start = match mode {
-        MoveMode::Standard => None,
-        MoveMode::OfflineSystem {
-            checkpoint_partition_start_lba,
-        } => {
-            if checkpoint_partition_start_lba == src_start_lba
-                || !layout.partitions.iter().any(|partition| {
-                    partition.offset_bytes / sector == checkpoint_partition_start_lba
-                })
-            {
-                return Err(ParqError::ValidationFailed(
-                    "오프라인 checkpoint 파티션이 대상 디스크의 별도 파티션으로 확인되지 않습니다"
-                        .into(),
-                ));
-            }
-            Some(checkpoint_partition_start_lba)
-        }
-    };
-
     let start_state = match layout.partition_style {
         disk::PartitionStyle::Mbr => {
             partition_table::read_start_state_mbr(&disk, src_start_lba, new_start_lba)?
@@ -570,7 +576,7 @@ where
 
     match mode {
         MoveMode::Standard => safety::check_partition_destructive(layout, src_part)?,
-        MoveMode::OfflineSystem { .. } => {
+        MoveMode::OfflineSystem => {
             safety::check_partition_offline_system_move_lockable(layout, src_part)?
         }
     }
@@ -579,7 +585,7 @@ where
     if length_sectors == 0 {
         return Err(ParqError::ValidationFailed("파티션 길이가 0".into()));
     }
-    if matches!(mode, MoveMode::OfflineSystem { .. }) {
+    if mode == MoveMode::OfflineSystem {
         ntfs_boot::validate_move_source(&disk, src_start_lba, new_start_lba, length_sectors)?;
     }
 
@@ -600,26 +606,14 @@ where
     }
 
     // 인접 파티션 무변경 스냅샷 (charter §3-6).
-    let adjacent_before = hash_others(
-        &disk,
-        layout,
-        src_start_lba,
-        excluded_checkpoint_start,
-        sector,
-    )?;
+    let adjacent_before = hash_others(&disk, layout, src_start_lba, sector)?;
 
     // 데이터 이동 (checkpoint + 라운드트립).
     let plan = plan_move(disk_number, src_start_lba, new_start_lba, length_sectors)?;
     let data = execute_move_with_events(&plan, checkpoint_path, &mut on_event)?;
 
     // 인접 무변경 재확인.
-    let adjacent_after = hash_others(
-        &disk,
-        layout,
-        src_start_lba,
-        excluded_checkpoint_start,
-        sector,
-    )?;
+    let adjacent_after = hash_others(&disk, layout, src_start_lba, sector)?;
     if adjacent_before != adjacent_after {
         return Err(ParqError::ValidationFailed(
             "인접 파티션이 변경되었습니다! 파티션 테이블을 갱신하지 않았고 원본은 src 에 \
@@ -831,14 +825,13 @@ fn hash_others(
     disk: &WritableDisk,
     layout: &disk::Disk,
     exclude_start_lba: u64,
-    exclude_checkpoint_start_lba: Option<u64>,
     sector: u64,
 ) -> Result<Vec<(String, String)>> {
     let chunk_sectors = (CHUNK_BYTES / sector).max(1);
     let mut out = Vec::new();
     for p in &layout.partitions {
         let p_start = p.offset_bytes / sector;
-        if p_start == exclude_start_lba || exclude_checkpoint_start_lba == Some(p_start) {
+        if p_start == exclude_start_lba {
             continue;
         }
         let p_len = p.size_bytes / sector;
@@ -990,6 +983,20 @@ mod tests {
     fn partition_start_reserves_first_mib() {
         assert_eq!(minimum_partition_start_lba(512), 2048);
         assert_eq!(minimum_partition_start_lba(4096), 256);
+    }
+
+    #[test]
+    fn checkpoint_path_requires_an_absolute_drive_path() {
+        assert_eq!(
+            checkpoint_drive_letter(Path::new("P:\\Parq\\move.json")).unwrap(),
+            'P'
+        );
+        assert_eq!(
+            checkpoint_drive_letter(Path::new("z:/Parq/move.json")).unwrap(),
+            'Z'
+        );
+        assert!(checkpoint_drive_letter(Path::new("move.json")).is_err());
+        assert!(checkpoint_drive_letter(Path::new("X:relative.json")).is_err());
     }
 
     #[test]

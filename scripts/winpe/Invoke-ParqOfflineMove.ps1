@@ -81,14 +81,21 @@ $RequestPath = (Resolve-Path -LiteralPath $RequestPath).Path
 $request = Get-Content -Raw -LiteralPath $RequestPath -Encoding UTF8 | ConvertFrom-Json
 
 $required = @(
-    "diskNumber", "expectedDiskSize", "expectedModel", "expectedSourceSizeBefore",
+    "requestVersion", "diskNumber", "expectedDiskSize", "expectedModel", "expectedSerial",
+    "expectedSourceSizeBefore",
     "expectedSourceSizeAfter", "srcStartLba", "newStartLba",
-    "checkpointPartitionStartLba", "checkpointPath", "statePath"
+    "checkpointDiskNumber", "expectedCheckpointDiskSize", "expectedCheckpointModel",
+    "expectedCheckpointSerial",
+    "checkpointPartitionStartLba", "expectedCheckpointPartitionSize",
+    "checkpointPath", "statePath"
 )
 foreach ($name in $required) {
     if ($null -eq $request.PSObject.Properties[$name]) {
         throw "request.json is missing required field: $name"
     }
+}
+if ([int]$request.requestVersion -ne 2) {
+    throw "Unsupported requestVersion: $($request.requestVersion)"
 }
 
 $checkpointLetter = Get-RequestLetter -Path ([string]$request.checkpointPath)
@@ -96,6 +103,7 @@ $stateLetter = Get-RequestLetter -Path ([string]$request.statePath)
 if ($checkpointLetter -ne $stateLetter) {
     throw "checkpointPath and statePath must use the same drive."
 }
+$requestInitialLetter = Get-RequestLetter -Path $RequestPath
 
 $disk = Get-Disk -Number ([int]$request.diskNumber) -ErrorAction Stop
 if ([long]$disk.Size -ne [long]$request.expectedDiskSize) {
@@ -122,7 +130,6 @@ if ($actualModel -cne [string]$request.expectedModel -or
 $sectorSize = [long]$disk.LogicalSectorSize
 $sourceOffset = [decimal]$request.srcStartLba * [decimal]$sectorSize
 $newOffset = [decimal]$request.newStartLba * [decimal]$sectorSize
-$checkpointOffset = [decimal]$request.checkpointPartitionStartLba * [decimal]$sectorSize
 $partitions = @(Get-Partition -DiskNumber $disk.Number)
 $source = @($partitions | Where-Object {
     [long]$_.Offset -eq $sourceOffset -or [long]$_.Offset -eq $newOffset
@@ -130,12 +137,49 @@ $source = @($partitions | Where-Object {
 if ($source.Count -ne 1) {
     throw "Exactly one partition must match the requested old/new start LBA."
 }
-$checkpoint = @($partitions | Where-Object { [long]$_.Offset -eq $checkpointOffset })
+
+if ([int]$request.checkpointDiskNumber -eq [int]$request.diskNumber) {
+    throw "The checkpoint disk must be physically separate from the target disk."
+}
+$checkpointDisk = Get-Disk -Number ([int]$request.checkpointDiskNumber) -ErrorAction Stop
+if ([long]$checkpointDisk.Size -ne [long]$request.expectedCheckpointDiskSize) {
+    throw "Checkpoint disk size differs from request.json."
+}
+if ([string]$checkpointDisk.PartitionStyle -ne "GPT" -or $checkpointDisk.IsReadOnly -or
+    $checkpointDisk.IsSystem -or $checkpointDisk.IsBoot) {
+    throw "The checkpoint disk must be writable GPT and must not be a system/boot disk."
+}
+$rawCheckpointDisk = @(Get-CimInstance -Namespace "ROOT\Microsoft\Windows\Storage" -ClassName MSFT_Disk |
+    Where-Object { $_.Number -eq $checkpointDisk.Number })
+if ($rawCheckpointDisk.Count -ne 1) {
+    throw "Exactly one MSFT_Disk must match the checkpoint disk number."
+}
+$actualCheckpointModel = ([string]$rawCheckpointDisk[0].Model).Trim()
+if ([string]::IsNullOrWhiteSpace($actualCheckpointModel)) {
+    $actualCheckpointModel = "Unknown"
+}
+$actualCheckpointSerial = ([string]$rawCheckpointDisk[0].SerialNumber).Trim()
+$expectedCheckpointSerial = [string]$request.expectedCheckpointSerial
+if ($actualCheckpointModel -cne [string]$request.expectedCheckpointModel -or
+    $actualCheckpointSerial -cne $expectedCheckpointSerial) {
+    throw "Checkpoint disk model/serial fingerprint differs from request.json."
+}
+$checkpointSectorSize = [long]$checkpointDisk.LogicalSectorSize
+$checkpointOffset = [decimal]$request.checkpointPartitionStartLba * [decimal]$checkpointSectorSize
+$checkpoint = @(Get-Partition -DiskNumber $checkpointDisk.Number | Where-Object {
+    [long]$_.Offset -eq $checkpointOffset
+})
 if ($checkpoint.Count -ne 1) {
     throw "Exactly one partition must match the checkpoint start LBA."
 }
-if ($source[0].PartitionNumber -eq $checkpoint[0].PartitionNumber) {
-    throw "Source and checkpoint resolve to the same partition."
+if ([long]$checkpoint[0].Size -ne [long]$request.expectedCheckpointPartitionSize) {
+    throw "Checkpoint partition size differs from request.json."
+}
+$requestPartition = @(Get-Partition -DriveLetter $requestInitialLetter -ErrorAction Stop)
+if ($requestPartition.Count -ne 1 -or
+    $requestPartition[0].DiskNumber -ne $checkpoint[0].DiskNumber -or
+    $requestPartition[0].PartitionNumber -ne $checkpoint[0].PartitionNumber) {
+    throw "request.json was not loaded from the fingerprinted checkpoint partition."
 }
 
 Set-VerifiedDriveLetter -Partition $checkpoint[0] -Letter $checkpointLetter `
@@ -166,7 +210,7 @@ Write-Host "  Request: $requestPathAfterMount"
 Write-Host "  Disk: #$($disk.Number) $($disk.FriendlyName) ($($disk.Size) bytes)"
 Write-Host "  Source: partition #$($source[0].PartitionNumber), $sourceLetter`:"
 Write-Host "  Move: LBA $($request.srcStartLba) -> $($request.newStartLba)"
-Write-Host "  Checkpoint: partition #$($checkpoint[0].PartitionNumber), $checkpointLetter`:"
+Write-Host "  Checkpoint: disk #$($checkpointDisk.Number), partition #$($checkpoint[0].PartitionNumber), $checkpointLetter`:"
 Write-Host ""
 
 if ($Action -eq "Interactive") {

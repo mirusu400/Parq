@@ -11,6 +11,7 @@ mod windows_main {
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct Request {
+        request_version: u32,
         disk_number: u32,
         expected_disk_size: u64,
         expected_model: String,
@@ -19,7 +20,12 @@ mod windows_main {
         expected_source_size_after: u64,
         src_start_lba: u64,
         new_start_lba: u64,
+        checkpoint_disk_number: u32,
+        expected_checkpoint_disk_size: u64,
+        expected_checkpoint_model: String,
+        expected_checkpoint_serial: Option<String>,
         checkpoint_partition_start_lba: u64,
+        expected_checkpoint_partition_size: u64,
         checkpoint_path: PathBuf,
         state_path: PathBuf,
     }
@@ -117,6 +123,12 @@ mod windows_main {
 
     fn validate_disk_fingerprint(request: &Request) -> Result<(u64, disk::Disk)> {
         safety::require_offline_system_move()?;
+        if request.request_version != 2 {
+            return Err(ParqError::ValidationFailed(format!(
+                "unsupported offline request version: {}",
+                request.request_version
+            )));
+        }
         let confirmation = std::env::var("PARQ_OFFLINE_CONFIRMATION").unwrap_or_default();
         let expected = expected_confirmation(request);
         if confirmation != expected {
@@ -149,20 +161,64 @@ mod windows_main {
         Ok((sector, target))
     }
 
-    fn validate_checkpoint_partition(
-        request: &Request,
-        target: &disk::Disk,
-        sector: u64,
-    ) -> Result<()> {
-        let checkpoint_partition = target
+    fn validate_checkpoint_partition(request: &Request, target_disk_number: u32) -> Result<()> {
+        if request.checkpoint_disk_number == target_disk_number {
+            return Err(ParqError::ValidationFailed(
+                "checkpoint disk must be physically separate from the move target".into(),
+            ));
+        }
+        let geometry =
+            raw_io::open_physical_drive_readonly(request.checkpoint_disk_number)?.geometry();
+        if geometry.total_bytes != request.expected_checkpoint_disk_size {
+            return Err(ParqError::ValidationFailed(format!(
+                "checkpoint disk size mismatch: actual={}, expected={}",
+                geometry.total_bytes, request.expected_checkpoint_disk_size
+            )));
+        }
+        let checkpoint_sector = u64::from(geometry.logical_sector_bytes);
+        if checkpoint_sector == 0 {
+            return Err(ParqError::Platform(
+                "checkpoint disk logical sector size is zero".into(),
+            ));
+        }
+        let checkpoint_disk = disk::enumerate()?
+            .into_iter()
+            .find(|disk| disk.number == request.checkpoint_disk_number)
+            .ok_or_else(|| {
+                ParqError::DiskNotFound(format!("disk {}", request.checkpoint_disk_number))
+            })?;
+        if checkpoint_disk.partition_style != PartitionStyle::Gpt
+            || checkpoint_disk.is_read_only
+            || checkpoint_disk.is_system
+            || checkpoint_disk.model != request.expected_checkpoint_model
+            || checkpoint_disk.serial != request.expected_checkpoint_serial
+        {
+            return Err(ParqError::ValidationFailed(
+                "checkpoint disk GPT/writable/system/model/serial fingerprint mismatch".into(),
+            ));
+        }
+        let checkpoint_partition = checkpoint_disk
             .partitions
             .iter()
             .find(|partition| {
-                partition.offset_bytes / sector == request.checkpoint_partition_start_lba
+                partition.offset_bytes / checkpoint_sector == request.checkpoint_partition_start_lba
             })
             .ok_or_else(|| {
                 ParqError::ValidationFailed("checkpoint 파티션을 찾을 수 없습니다".into())
             })?;
+        if checkpoint_partition.size_bytes != request.expected_checkpoint_partition_size
+            || checkpoint_partition.is_boot
+            || checkpoint_partition.is_system
+            || checkpoint_partition.bitlocker_status != BitLockerStatus::NotEncrypted
+            || !matches!(
+                checkpoint_partition.file_system,
+                FileSystemKind::Ntfs | FileSystemKind::Fat32 | FileSystemKind::ExFat
+            )
+        {
+            return Err(ParqError::ValidationFailed(
+                "checkpoint partition size/role/filesystem/encryption fingerprint mismatch".into(),
+            ));
+        }
         let checkpoint_letter = drive_letter(&request.checkpoint_path);
         if checkpoint_letter.is_none() || checkpoint_letter != drive_letter(&request.state_path) {
             return Err(ParqError::ValidationFailed(
@@ -171,14 +227,15 @@ mod windows_main {
         }
         let checkpoint_letter = checkpoint_letter.expect("checked above");
         let extent = raw_io::volume::query_volume_extent(&checkpoint_letter.to_string())?;
-        if extent.disk_number != request.disk_number
-            || extent.starting_offset_bytes / sector != request.checkpoint_partition_start_lba
-            || extent.extent_length_bytes != checkpoint_partition.size_bytes
+        if extent.disk_number != request.checkpoint_disk_number
+            || extent.starting_offset_bytes / checkpoint_sector
+                != request.checkpoint_partition_start_lba
+            || extent.extent_length_bytes != request.expected_checkpoint_partition_size
         {
             return Err(ParqError::ValidationFailed(format!(
                 "checkpoint volume extent mismatch: disk={}, start={}, length={}",
                 extent.disk_number,
-                extent.starting_offset_bytes / sector,
+                extent.starting_offset_bytes / checkpoint_sector,
                 extent.extent_length_bytes
             )));
         }
@@ -187,6 +244,7 @@ mod windows_main {
 
     fn preflight(request: &Request) -> Result<()> {
         let (sector, target) = validate_disk_fingerprint(request)?;
+        validate_checkpoint_partition(request, target.number)?;
         let source = target
             .partitions
             .iter()
@@ -221,7 +279,7 @@ mod windows_main {
     fn run(request_path: &Path) -> Result<()> {
         let request: Request = read_json(request_path)?;
         let (sector, target) = validate_disk_fingerprint(&request)?;
-        validate_checkpoint_partition(&request, &target, sector)?;
+        validate_checkpoint_partition(&request, target.number)?;
         let source_drive_letter = target
             .partitions
             .iter()
@@ -238,7 +296,7 @@ mod windows_main {
             .to_string();
         let mut state = if request.state_path.exists() {
             let state: State = read_json(&request.state_path)?;
-            if state.version != 1 || state.request != request {
+            if state.version != 2 || state.request != request {
                 return Err(ParqError::ValidationFailed(
                     "기존 offline state가 현재 request와 일치하지 않습니다".into(),
                 ));
@@ -269,7 +327,7 @@ mod windows_main {
             }
             let length_sectors = source.size_bytes / sector;
             let state = State {
-                version: 1,
+                version: 2,
                 request: request.clone(),
                 length_sectors,
                 phase: Phase::Moving,
@@ -284,7 +342,6 @@ mod windows_main {
                     request.disk_number,
                     request.src_start_lba,
                     request.new_start_lba,
-                    request.checkpoint_partition_start_lba,
                     &source_drive_letter,
                     &request.checkpoint_path,
                     |event| {

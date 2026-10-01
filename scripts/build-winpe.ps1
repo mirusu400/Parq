@@ -77,6 +77,19 @@ function Get-PeMachine {
     }
 }
 
+function Assert-StaticCrt {
+    param([Parameter(Mandatory)][string]$Path)
+
+    $imageText = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($Path))
+    $dynamicCrt = [regex]::Match(
+        $imageText,
+        '(?i)VCRUNTIME[0-9_]*\.dll|MSVCP[0-9_]*\.dll|ucrtbase\.dll|api-ms-win-crt-[a-z0-9-]+\.dll'
+    )
+    if ($dynamicCrt.Success) {
+        throw "Executable imports a C/C++ runtime that is not guaranteed in WinPE ($($dynamicCrt.Value)). Rebuild it with -C target-feature=+crt-static."
+    }
+}
+
 function Add-WinPeOptionalComponent {
     param(
         [Parameter(Mandatory)][string]$Name,
@@ -130,16 +143,33 @@ $env:OSCDImgRoot = $oscdImgRoot
 $env:PATH = "$dismRoot;$bcdBootRoot;$oscdImgRoot;$env:PATH"
 
 if ([string]::IsNullOrWhiteSpace($OfflineBinaryPath)) {
-    $rustHost = (& rustc -vV | Select-String '^host:' | ForEach-Object {
+    $rustBin = Join-Path $env:USERPROFILE ".cargo\bin"
+    $rustcPath = Join-Path $rustBin "rustc.exe"
+    $cargoPath = Join-Path $rustBin "cargo.exe"
+    if (-not (Test-Path -LiteralPath $rustcPath)) {
+        $rustcPath = (Get-Command rustc -ErrorAction Stop).Source
+    }
+    if (-not (Test-Path -LiteralPath $cargoPath)) {
+        $cargoPath = (Get-Command cargo -ErrorAction Stop).Source
+    }
+    $rustHost = (& $rustcPath -vV | Select-String '^host:' | ForEach-Object {
         $_.Line.Substring(5).Trim()
     })
     $requiredHostPrefix = if ($Architecture -eq "arm64") { "aarch64-" } else { "x86_64-" }
     if (-not $rustHost.StartsWith($requiredHostPrefix, [StringComparison]::OrdinalIgnoreCase)) {
         throw "Rust host $rustHost cannot build a $Architecture WinPE binary. Supply a matching build with -OfflineBinaryPath."
     }
-    Invoke-Checked -FilePath "cargo" `
-        -Arguments @("build", "--release", "--manifest-path", (Join-Path $repoRoot "src-tauri\Cargo.toml"), "--example", "offline_system_move") `
-        -Description "Build offline_system_move release binary"
+    $previousRustFlags = $env:RUSTFLAGS
+    $env:RUSTFLAGS = (($previousRustFlags, "-C target-feature=+crt-static") |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join " "
+    try {
+        Invoke-Checked -FilePath $cargoPath `
+            -Arguments @("build", "--release", "--manifest-path", (Join-Path $repoRoot "src-tauri\Cargo.toml"), "--example", "offline_system_move") `
+            -Description "Build static-CRT offline_system_move release binary"
+    }
+    finally {
+        $env:RUSTFLAGS = $previousRustFlags
+    }
     $OfflineBinaryPath = Join-Path $repoRoot "src-tauri\target\release\examples\offline_system_move.exe"
 }
 $offlineBinary = (Resolve-Path -LiteralPath $OfflineBinaryPath).Path
@@ -148,6 +178,7 @@ $actualMachine = Get-PeMachine -Path $offlineBinary
 if ($actualMachine -ne $expectedMachine) {
     throw ("Executable architecture does not match WinPE: actual=0x{0:X4}, expected=0x{1:X4}" -f $actualMachine, $expectedMachine)
 }
+Assert-StaticCrt -Path $offlineBinary
 
 if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
     $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
