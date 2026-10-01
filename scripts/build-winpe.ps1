@@ -90,6 +90,48 @@ function Assert-StaticCrt {
     }
 }
 
+function Import-VsBuildEnvironment {
+    param([Parameter(Mandatory)][ValidateSet("amd64", "arm64")][string]$Target)
+
+    $vsWhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+    if (-not (Test-Path -LiteralPath $vsWhere)) {
+        throw "Visual Studio Build Tools were not found. Install the MSVC tools or supply -OfflineBinaryPath."
+    }
+    $component = if ($Target -eq "arm64") {
+        "Microsoft.VisualStudio.Component.VC.Tools.ARM64"
+    }
+    else {
+        "Microsoft.VisualStudio.Component.VC.Tools.x86.x64"
+    }
+    $installation = @(& $vsWhere -latest -products * -requires $component -property installationPath)
+    if ($LASTEXITCODE -ne 0 -or $installation.Count -ne 1) {
+        throw "A Visual Studio installation with the $Target MSVC tools was not found."
+    }
+    $vcVarsAll = Join-Path $installation[0].Trim() "VC\Auxiliary\Build\vcvarsall.bat"
+    if (-not (Test-Path -LiteralPath $vcVarsAll)) {
+        throw "vcvarsall.bat was not found: $vcVarsAll"
+    }
+
+    $command = 'call "' + $vcVarsAll + '" ' + $Target + ' >nul && set'
+    $environment = @(& cmd.exe /d /c $command)
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to initialize the Visual Studio $Target build environment."
+    }
+    foreach ($line in $environment) {
+        $separator = $line.IndexOf('=')
+        if ($separator -gt 0) {
+            [Environment]::SetEnvironmentVariable(
+                $line.Substring(0, $separator),
+                $line.Substring($separator + 1),
+                [EnvironmentVariableTarget]::Process
+            )
+        }
+    }
+    if ($null -eq (Get-Command link.exe -ErrorAction SilentlyContinue)) {
+        throw "The Visual Studio environment did not expose link.exe."
+    }
+}
+
 function Add-WinPeOptionalComponent {
     param(
         [Parameter(Mandatory)][string]$Name,
@@ -159,18 +201,26 @@ if ([string]::IsNullOrWhiteSpace($OfflineBinaryPath)) {
     if (-not $rustHost.StartsWith($requiredHostPrefix, [StringComparison]::OrdinalIgnoreCase)) {
         throw "Rust host $rustHost cannot build a $Architecture WinPE binary. Supply a matching build with -OfflineBinaryPath."
     }
+    Import-VsBuildEnvironment -Target $Architecture
     $previousRustFlags = $env:RUSTFLAGS
+    $previousRustc = $env:RUSTC
     $env:RUSTFLAGS = (($previousRustFlags, "-C target-feature=+crt-static") |
         Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join " "
+    $env:RUSTC = $rustcPath
     try {
         Invoke-Checked -FilePath $cargoPath `
-            -Arguments @("build", "--release", "--manifest-path", (Join-Path $repoRoot "src-tauri\Cargo.toml"), "--example", "offline_system_move") `
+            -Arguments @(
+                "build", "--release", "--target", $rustHost,
+                "--manifest-path", (Join-Path $repoRoot "src-tauri\Cargo.toml"),
+                "--example", "offline_system_move"
+            ) `
             -Description "Build static-CRT offline_system_move release binary"
     }
     finally {
         $env:RUSTFLAGS = $previousRustFlags
+        $env:RUSTC = $previousRustc
     }
-    $OfflineBinaryPath = Join-Path $repoRoot "src-tauri\target\release\examples\offline_system_move.exe"
+    $OfflineBinaryPath = Join-Path $repoRoot "src-tauri\target\$rustHost\release\examples\offline_system_move.exe"
 }
 $offlineBinary = (Resolve-Path -LiteralPath $OfflineBinaryPath).Path
 $expectedMachine = if ($Architecture -eq "arm64") { 0xAA64 } else { 0x8664 }

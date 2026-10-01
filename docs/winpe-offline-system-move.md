@@ -12,6 +12,10 @@ Windows ADK와 같은 버전의 WinPE add-on을 설치한다. ARM64 VM은 ARM64 
 ARM64 `offline_system_move.exe`가 모두 필요하다. ISO 빌더는 실행 파일의 PE machine 값을
 확인해 아키텍처가 다르면 중단한다.
 
+실행 파일까지 자동 빌드하려면 대상 아키텍처의 Rust MSVC 툴체인과 Visual Studio Build Tools가
+필요하다. ISO 빌더는 `vswhere.exe`로 설치를 찾고 `vcvarsall.bat`을 불러온다. 이미 빌드한 실행
+파일을 `-OfflineBinaryPath`로 지정하면 이 두 빌드 도구는 필요하지 않다.
+
 체크포인트 볼륨은 이동 대상과 **다른 물리 디스크**에 있어야 한다. VM에서는 작은 두 번째 GPT
 가상 디스크에 NTFS 볼륨을 하나 만드는 방식을 권장한다. 요청·상태·체크포인트 파일은 모두 이
 외부 볼륨에 저장된다. 대상 디스크 안의 파티션이나 WinPE의 `X:` RAM 드라이브는 사용할 수 없다.
