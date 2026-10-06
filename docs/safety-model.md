@@ -88,6 +88,10 @@ match partition::execute(&plan, &txn) {
   부분 성공 가능성이 있는 작업은 단계 로그를 보고 수동 확인해야 한다.
 - V2 MBR/GPT 이동은 별도 checkpoint와 SHA256 검증으로 중단 후 재개한다. GPT는 backup
   엔트리·헤더를 먼저 기록하고 primary 엔트리·헤더를 기록하며 각 경계를 checkpoint에 남긴다.
+- WinPE 시스템 볼륨 이동은 GPT 갱신과 NTFS boot metadata 갱신을 별도 재개 단계로 기록한다.
+  NTFS 단계는 완료된 데이터/GPT checkpoint, 새 파티션 시작·길이, 드라이브 문자의 단일 물리
+  extent가 모두 일치할 때만 진행한다. primary/backup boot sector는 잠금·분리된 볼륨 핸들의
+  상대 오프셋으로 기록하고 flush 후 전체 섹터를 되읽어 검증한다.
 
 ## 시스템 디스크 정의
 
@@ -182,3 +186,4 @@ PARQ_DEV_ALLOW_INTERNAL_DISKS=1 cargo tauri dev
 
 - 2026-04-28: 초기 작성 (V0 스캐폴드)
 - 2026-09-29: 개발자용 WinPE 시스템 볼륨 이동 게이트와 실행 전 fingerprint 검증 명시
+- 2026-10-06: GPT 완료 뒤 NTFS boot metadata를 별도 checkpoint 단계로 재개하는 규칙 명시

@@ -87,8 +87,16 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass `
 ```
 
 `Execute`는 원본 볼륨을 잠그고 분리한 뒤 checkpoint 기반 복사, SHA-256 검증, GPT backup/primary
-갱신, NTFS hidden-sectors 갱신을 수행한다. 중간에 전원이 끊기면 같은 ISO와 같은 request로 다시
-실행해 checkpoint 복구 경로로 진입한다.
+갱신을 먼저 완료한다. 그 다음 상태를 `patching_ntfs_boot`로 기록하고, 새 시작 LBA를 가리키는
+볼륨 extent를 다시 확인한 뒤 볼륨을 잠금·분리해 primary/backup NTFS boot sector의
+hidden-sectors 값을 갱신한다. 이 기록은 물리 디스크 핸들이 아니라 잠긴 볼륨의 상대 오프셋으로
+수행하며 두 섹터를 되읽어 전체 내용이 예상값과 같은지 검증한다.
+
+GPT 갱신 뒤 NTFS 단계 전에 중단돼도 데이터 복사를 반복하지 않는다. 같은 ISO와 request로 다시
+실행하면 `offline-state.json`, 완료된 move checkpoint, 현재 GPT 위치를 함께 검증하고
+`patching_ntfs_boot`부터 재개한다. 체크포인트의 plan·청크 수·완료 커서·원본 SHA-256이 정확히
+일치하지 않거나 현재 볼륨 extent가 새 시작 LBA와 길이에 일치하지 않으면 어떤 부트 섹터도 쓰지
+않고 중단한다. 성공하면 checkpoint는 `done_boot_metadata`, offline state는 `done`이 된다.
 
 ## 재부팅 전 백업 규칙
 

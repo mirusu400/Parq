@@ -38,6 +38,12 @@ mod windows_main {
         Done,
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum ResumeAction {
+        Move,
+        PatchNtfsBoot,
+    }
+
     #[derive(Debug, Clone, Serialize, Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct State {
@@ -118,6 +124,16 @@ mod windows_main {
             Err(ParqError::ValidationFailed(format!(
                 "preflight 원본 크기가 request의 축소 전/후 크기와 모두 다릅니다: actual={actual}, before={before}, after={after}"
             )))
+        }
+    }
+
+    fn resume_action(has_old_start: bool, has_new_start: bool) -> Result<ResumeAction> {
+        match (has_old_start, has_new_start) {
+            (true, false) => Ok(ResumeAction::Move),
+            (false, true) => Ok(ResumeAction::PatchNtfsBoot),
+            _ => Err(ParqError::ValidationFailed(
+                "old/new 시작 LBA 중 정확히 하나에 대상 파티션이 있어야 합니다".into(),
+            )),
         }
     }
 
@@ -280,14 +296,26 @@ mod windows_main {
         let request: Request = read_json(request_path)?;
         let (sector, target) = validate_disk_fingerprint(&request)?;
         validate_checkpoint_partition(&request, target.number)?;
-        let source_drive_letter = target
-            .partitions
-            .iter()
-            .find(|partition| {
-                let start_lba = partition.offset_bytes / sector;
-                start_lba == request.src_start_lba || start_lba == request.new_start_lba
-            })
-            .and_then(|partition| partition.drive_letter.as_deref())
+        let mut matching_sources = target.partitions.iter().filter(|partition| {
+            let start_lba = partition.offset_bytes / sector;
+            start_lba == request.src_start_lba || start_lba == request.new_start_lba
+        });
+        let source = matching_sources.next().ok_or_else(|| {
+            ParqError::ValidationFailed("old/new 시작 LBA에서 대상 파티션을 찾지 못했습니다".into())
+        })?;
+        if matching_sources.next().is_some() {
+            return Err(ParqError::ValidationFailed(
+                "old/new 시작 LBA에 둘 이상의 파티션이 있습니다".into(),
+            ));
+        }
+        let current_start_lba = source.offset_bytes / sector;
+        let resume_action = resume_action(
+            current_start_lba == request.src_start_lba,
+            current_start_lba == request.new_start_lba,
+        )?;
+        let source_drive_letter = source
+            .drive_letter
+            .as_deref()
             .ok_or_else(|| {
                 ParqError::ValidationFailed(
                     "source partition must have a drive letter before locking".into(),
@@ -303,13 +331,11 @@ mod windows_main {
             }
             state
         } else {
-            let source = target
-                .partitions
-                .iter()
-                .find(|partition| partition.offset_bytes / sector == request.src_start_lba)
-                .ok_or_else(|| {
-                    ParqError::ValidationFailed("request의 원본 파티션을 찾을 수 없습니다".into())
-                })?;
+            if resume_action != ResumeAction::Move {
+                return Err(ParqError::ValidationFailed(
+                    "새 시작 LBA에 파티션이 있지만 offline state가 없습니다".into(),
+                ));
+            }
             safety::check_partition_offline_system_move_lockable(&target, source)?;
             if !matches!(
                 source.file_system,
@@ -335,9 +361,27 @@ mod windows_main {
             write_state(&request.state_path, &state)?;
             state
         };
+        let state_length_bytes = state
+            .length_sectors
+            .checked_mul(sector)
+            .ok_or_else(|| ParqError::ValidationFailed("offline state 길이 overflow".into()))?;
+        if source.size_bytes != state_length_bytes
+            || source.size_bytes != request.expected_source_size_after
+        {
+            return Err(ParqError::ValidationFailed(format!(
+                "현재 파티션 길이가 offline state/request와 다릅니다: actual={}, state={}, request={}",
+                source.size_bytes, state_length_bytes, request.expected_source_size_after
+            )));
+        }
 
         match state.phase {
             Phase::Moving => {
+                if resume_action == ResumeAction::PatchNtfsBoot {
+                    let message =
+                        "[RECOVER] GPT는 새 시작 LBA에 있습니다. 완료 checkpoint를 검증하고 데이터 복사 없이 NTFS 부트 메타데이터 복구를 준비합니다.";
+                    println!("{message}");
+                    append_run_log(&request.state_path, message);
+                }
                 let outcome = move_engine::move_partition_offline_system(
                     request.disk_number,
                     request.src_start_lba,
@@ -363,21 +407,43 @@ mod windows_main {
                         "이동 결과 길이가 offline state와 다릅니다".into(),
                     ));
                 }
-                state.phase = Phase::Done;
+                state.phase = Phase::PatchingNtfsBoot;
                 write_state(&request.state_path, &state)?;
-            }
-            Phase::PatchingNtfsBoot => {
                 move_engine::patch_ntfs_boot_metadata_offline(
                     request.disk_number,
                     request.src_start_lba,
                     request.new_start_lba,
                     state.length_sectors,
                     &source_drive_letter,
+                    &request.checkpoint_path,
                 )?;
                 state.phase = Phase::Done;
                 write_state(&request.state_path, &state)?;
             }
-            Phase::Done => {}
+            Phase::PatchingNtfsBoot => {
+                if resume_action != ResumeAction::PatchNtfsBoot {
+                    return Err(ParqError::ValidationFailed(
+                        "NTFS 복구 단계인데 파티션이 아직 이전 시작 LBA에 있습니다".into(),
+                    ));
+                }
+                move_engine::patch_ntfs_boot_metadata_offline(
+                    request.disk_number,
+                    request.src_start_lba,
+                    request.new_start_lba,
+                    state.length_sectors,
+                    &source_drive_letter,
+                    &request.checkpoint_path,
+                )?;
+                state.phase = Phase::Done;
+                write_state(&request.state_path, &state)?;
+            }
+            Phase::Done => {
+                if resume_action != ResumeAction::PatchNtfsBoot {
+                    return Err(ParqError::ValidationFailed(
+                        "완료 state인데 파티션이 새 시작 LBA에 없습니다".into(),
+                    ));
+                }
+            }
         }
         println!(
             "[PASS] offline Windows partition move complete: disk={} {}→{} len={}",
@@ -426,7 +492,7 @@ mod windows_main {
 
     #[cfg(test)]
     mod tests {
-        use super::preflight_size_state;
+        use super::{preflight_size_state, resume_action, ResumeAction};
 
         #[test]
         fn preflight_accepts_before_and_after_sizes_only() {
@@ -434,6 +500,17 @@ mod windows_main {
             assert_eq!(preflight_size_state(80, 100, 80).unwrap(), "ready");
             assert_eq!(preflight_size_state(100, 100, 100).unwrap(), "ready");
             assert!(preflight_size_state(90, 100, 80).is_err());
+        }
+
+        #[test]
+        fn resume_action_uses_exactly_one_partition_start() {
+            assert_eq!(resume_action(true, false).unwrap(), ResumeAction::Move);
+            assert_eq!(
+                resume_action(false, true).unwrap(),
+                ResumeAction::PatchNtfsBoot
+            );
+            assert!(resume_action(false, false).is_err());
+            assert!(resume_action(true, true).is_err());
         }
     }
 }

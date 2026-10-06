@@ -4,10 +4,9 @@
 //! 그래야 우리가 `\\.\PhysicalDriveN` 에 섹터를 쓰는 동안 FS 드라이버가 같은 섹터를 건드려
 //! 손상시키는 일을 막는다.
 //!
-//! **이 모듈은 디스크 데이터를 write 하지 않는다** — `FSCTL_LOCK_VOLUME` / `FSCTL_DISMOUNT_VOLUME`
-//! / `FSCTL_UNLOCK_VOLUME` 제어 호출만 한다. 실제 섹터 write(`WriteFile`)는 별도 PR(charter §3-5,
-//! Phase 3). lock/dismount 는 되돌릴 수 있는 작업이지만 볼륨을 마운트 해제하므로, 알파 게이트
-//! (`safety::require_v2_destructive`) 통과를 요구한다.
+//! 일반 경로는 `FSCTL_LOCK_VOLUME` / `FSCTL_DISMOUNT_VOLUME` / `FSCTL_UNLOCK_VOLUME`만
+//! 사용한다. 잠긴 볼륨의 NTFS 부트 메타데이터 복구를 위해서만 crate 내부에 제한된 상대 오프셋
+//! read/write를 제공한다. lock/dismount와 write 모두 알파 게이트 뒤에서만 접근한다.
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use core::ffi::c_void;
@@ -16,7 +15,8 @@ use tracing::{info, instrument};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE};
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    CreateFileW, FlushFileBuffers, ReadFile, SetFilePointerEx, WriteFile, FILE_BEGIN,
+    FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
     IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS, OPEN_EXISTING,
 };
 use windows::Win32::System::Ioctl::{
@@ -29,7 +29,7 @@ use crate::{safety, ParqError, Result};
 
 /// lock + dismount 된 볼륨 핸들. `Drop` 이 unlock + `CloseHandle` 을 보장한다(RAII).
 ///
-/// 이 핸들은 read/write 접근으로 열리지만, 이 타입은 어떤 `WriteFile` 도 노출/수행하지 않는다.
+/// crate 외부에는 write 기능을 노출하지 않는다. 내부 write는 lock+dismount 성공 후에만 가능하다.
 pub struct VolumeLock {
     handle: HANDLE,
     letter: String,
@@ -134,8 +134,8 @@ impl VolumeLock {
         let path = format!(r"\\.\{letter}:");
         let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
 
-        // SAFETY: wide 는 NUL 종단 UTF-16. RW 핸들이지만 이 래퍼는 WriteFile 을 절대 호출하지
-        //         않는다 — FSCTL 제어만. 반환 핸들은 즉시 VolumeLock(RAII)로 감싼다.
+        // SAFETY: wide 는 NUL 종단 UTF-16. 반환 핸들은 즉시 VolumeLock(RAII)로 감싼다.
+        //         crate 내부 write는 아래 lock+dismount 성공 뒤에만 허용한다.
         let handle = unsafe {
             CreateFileW(
                 PCWSTR(wide.as_ptr()),
@@ -170,6 +170,77 @@ impl VolumeLock {
     pub fn letter(&self) -> &str {
         &self.letter
     }
+
+    pub(crate) fn read_exact_at(&self, offset: u64, output: &mut [u8]) -> Result<()> {
+        if output.is_empty() {
+            return Err(ParqError::ValidationFailed(
+                "volume read buffer must not be empty".into(),
+            ));
+        }
+        let offset: i64 = offset
+            .try_into()
+            .map_err(|_| ParqError::ValidationFailed("volume read offset exceeds i64".into()))?;
+        unsafe { SetFilePointerEx(self.handle, offset, None, FILE_BEGIN) }
+            .map_err(|error| map_win_err("volume SetFilePointerEx(read)", &error))?;
+        let mut done = 0usize;
+        while done < output.len() {
+            let mut read = 0u32;
+            unsafe {
+                ReadFile(
+                    self.handle,
+                    Some(&mut output[done..]),
+                    Some(&mut read),
+                    None,
+                )
+            }
+            .map_err(|error| map_win_err("volume ReadFile", &error))?;
+            if read == 0 {
+                return Err(ParqError::Platform(format!(
+                    "volume read returned zero bytes: done={done}, total={}",
+                    output.len()
+                )));
+            }
+            done += read as usize;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn write_all_at(&self, offset: u64, data: &[u8]) -> Result<()> {
+        if !self.locked {
+            return Err(ParqError::ValidationFailed(
+                "volume write requires a locked volume".into(),
+            ));
+        }
+        if data.is_empty() {
+            return Err(ParqError::ValidationFailed(
+                "volume write buffer must not be empty".into(),
+            ));
+        }
+        let offset: i64 = offset
+            .try_into()
+            .map_err(|_| ParqError::ValidationFailed("volume write offset exceeds i64".into()))?;
+        unsafe { SetFilePointerEx(self.handle, offset, None, FILE_BEGIN) }
+            .map_err(|error| map_win_err("volume SetFilePointerEx(write)", &error))?;
+        let mut done = 0usize;
+        while done < data.len() {
+            let mut written = 0u32;
+            unsafe { WriteFile(self.handle, Some(&data[done..]), Some(&mut written), None) }
+                .map_err(|error| map_win_err("volume WriteFile", &error))?;
+            if written == 0 {
+                return Err(ParqError::Platform(format!(
+                    "volume write returned zero bytes: done={done}, total={}",
+                    data.len()
+                )));
+            }
+            done += written as usize;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn flush(&self) -> Result<()> {
+        unsafe { FlushFileBuffers(self.handle) }
+            .map_err(|error| map_win_err("volume FlushFileBuffers", &error))
+    }
 }
 
 impl Drop for VolumeLock {
@@ -189,4 +260,46 @@ fn fsctl(handle: HANDLE, code: u32, name: &str) -> Result<()> {
     // SAFETY: in/out 버퍼 없음(None, 0). 유효 핸들. 제어 코드만 전달.
     unsafe { DeviceIoControl(handle, code, None, 0, None, 0, Some(&mut returned), None) }
         .map_err(|e| map_win_err(name, &e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::disk::BusType;
+
+    #[test]
+    #[ignore = "requires an administrator-created disposable VHD volume"]
+    fn locked_vhd_accepts_identical_boot_sector_roundtrip() {
+        let letter = std::env::var("PARQ_TEST_VHD_DRIVE")
+            .expect("PARQ_TEST_VHD_DRIVE must name a disposable VHD volume");
+        let extent = query_volume_extent(&letter).expect("query test VHD extent");
+        let layout = crate::disk::enumerate()
+            .expect("enumerate test VHD")
+            .into_iter()
+            .find(|disk| disk.number == extent.disk_number)
+            .expect("find test VHD");
+        assert_eq!(layout.bus_type, BusType::Virtual);
+        assert!(!layout.is_system);
+        assert!(!layout.is_read_only);
+        assert!(layout.size_bytes <= 128 * 1024 * 1024);
+
+        let raw = crate::raw_io::open_physical_drive_readonly(extent.disk_number)
+            .expect("open test VHD read-only");
+        let sector_len = raw.geometry().logical_sector_bytes as usize;
+        drop(raw);
+        let volume = VolumeLock::lock_and_dismount(&letter).expect("lock test VHD volume");
+        let mut before = vec![0u8; sector_len];
+        volume
+            .read_exact_at(0, &mut before)
+            .expect("read test VHD boot sector");
+        volume
+            .write_all_at(0, &before)
+            .expect("rewrite identical test VHD boot sector");
+        volume.flush().expect("flush test VHD volume");
+        let mut after = vec![0u8; sector_len];
+        volume
+            .read_exact_at(0, &mut after)
+            .expect("verify test VHD boot sector");
+        assert_eq!(after, before);
+    }
 }

@@ -1,3 +1,4 @@
+use crate::raw_io::volume::VolumeLock;
 use crate::raw_io::write::WritableDisk;
 use crate::{ParqError, Result};
 
@@ -130,51 +131,55 @@ fn patch_hidden_sectors(bytes: &mut [u8], old_start_lba: u64, new_start_lba: u64
     Ok(())
 }
 
-pub(super) fn update_hidden_sectors(
-    disk: &WritableDisk,
+pub(super) fn update_hidden_sectors_on_locked_volume(
+    volume: &VolumeLock,
     old_start_lba: u64,
     new_start_lba: u64,
     length_sectors: u64,
+    sector_bytes: u64,
 ) -> Result<()> {
-    if length_sectors < 2 {
+    if length_sectors < 2 || sector_bytes < 512 {
         return Err(ParqError::ValidationFailed(
-            "NTFS 파티션 길이가 너무 작습니다".into(),
+            "NTFS volume geometry is invalid for boot metadata patching".into(),
         ));
     }
-    let sector_bytes = disk.geometry().logical_sector_bytes as u64;
-    let mut primary = vec![0u8; sector_bytes as usize];
-    let mut backup = vec![0u8; sector_bytes as usize];
-    let backup_lba = new_start_lba
-        .checked_add(length_sectors - 1)
-        .ok_or_else(|| ParqError::ValidationFailed("NTFS backup boot LBA overflow".into()))?;
-    disk.read_sectors(new_start_lba, &mut primary)?;
-    disk.read_sectors(backup_lba, &mut backup)?;
+    let sector_len: usize = sector_bytes
+        .try_into()
+        .map_err(|_| ParqError::ValidationFailed("NTFS sector size exceeds usize".into()))?;
+    let backup_offset = (length_sectors - 1)
+        .checked_mul(sector_bytes)
+        .ok_or_else(|| ParqError::ValidationFailed("NTFS backup byte offset overflow".into()))?;
+    let mut primary = vec![0u8; sector_len];
+    let mut backup = vec![0u8; sector_len];
+    volume.read_exact_at(0, &mut primary)?;
+    volume.read_exact_at(backup_offset, &mut backup)?;
     validate_boot_sector(&primary, sector_bytes, length_sectors)?;
     validate_boot_sector(&backup, sector_bytes, length_sectors)?;
     if volume_serial(&primary) != volume_serial(&backup) {
         return Err(ParqError::ValidationFailed(
-            "NTFS primary/backup boot sector의 volume serial이 다릅니다".into(),
+            "NTFS primary/backup boot sector volume serial mismatch".into(),
         ));
     }
-
     patch_hidden_sectors(&mut primary, old_start_lba, new_start_lba)?;
     patch_hidden_sectors(&mut backup, old_start_lba, new_start_lba)?;
-    disk.write_sectors(new_start_lba, &primary)?;
-    disk.write_sectors(backup_lba, &backup)?;
-    disk.flush()?;
+    volume.write_all_at(0, &primary)?;
+    volume.write_all_at(backup_offset, &backup)?;
+    volume.flush()?;
 
-    let mut verify_primary = vec![0u8; sector_bytes as usize];
-    let mut verify_backup = vec![0u8; sector_bytes as usize];
-    disk.read_sectors(new_start_lba, &mut verify_primary)?;
-    disk.read_sectors(backup_lba, &mut verify_backup)?;
-    let expected: u32 = new_start_lba.try_into().map_err(|_| {
-        ParqError::ValidationFailed("NTFS hidden sectors의 u32 범위를 초과했습니다".into())
-    })?;
-    if read_u32(&verify_primary, HIDDEN_SECTORS_OFFSET) != expected
+    let mut verify_primary = vec![0u8; sector_len];
+    let mut verify_backup = vec![0u8; sector_len];
+    volume.read_exact_at(0, &mut verify_primary)?;
+    volume.read_exact_at(backup_offset, &mut verify_backup)?;
+    let expected: u32 = new_start_lba
+        .try_into()
+        .map_err(|_| ParqError::ValidationFailed("NTFS hidden sectors exceeds u32".into()))?;
+    if verify_primary != primary
+        || verify_backup != backup
+        || read_u32(&verify_primary, HIDDEN_SECTORS_OFFSET) != expected
         || read_u32(&verify_backup, HIDDEN_SECTORS_OFFSET) != expected
     {
         return Err(ParqError::ValidationFailed(
-            "NTFS primary/backup hidden sectors 사후 검증에 실패했습니다".into(),
+            "NTFS volume-handle boot metadata verification failed".into(),
         ));
     }
     Ok(())

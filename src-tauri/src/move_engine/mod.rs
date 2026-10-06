@@ -147,7 +147,7 @@ struct Checkpoint {
     chunks_done: u64,
     /// 이동 전 src 영역 SHA256(hex). 첫 실행에서 write 이전에 계산해 고정.
     src_sha256: Option<String>,
-    /// "copying" | "verifying" | "done".
+    /// 복사/검증/테이블 갱신 단계 또는 "done" | "done_boot_metadata".
     phase: String,
 }
 
@@ -439,17 +439,14 @@ where
     P: FnMut(MoveEvent),
 {
     let _volume_lock = VolumeLock::lock_and_dismount(source_drive_letter)?;
-    let outcome = move_partition_with_events_mode(
+    move_partition_with_events_mode(
         disk_number,
         src_start_lba,
         new_start_lba,
         checkpoint_path,
         MoveMode::OfflineSystem,
         on_event,
-    )?;
-    let disk = open_writable(disk_number)?;
-    ntfs_boot::update_hidden_sectors(&disk, src_start_lba, new_start_lba, outcome.length_sectors)?;
-    Ok(outcome)
+    )
 }
 
 pub fn patch_ntfs_boot_metadata_offline(
@@ -458,11 +455,108 @@ pub fn patch_ntfs_boot_metadata_offline(
     new_start_lba: u64,
     length_sectors: u64,
     source_drive_letter: &str,
+    checkpoint_path: &Path,
 ) -> Result<()> {
     safety::require_offline_system_move()?;
-    let _volume_lock = VolumeLock::lock_and_dismount(source_drive_letter)?;
-    let disk = open_writable(disk_number)?;
-    ntfs_boot::update_hidden_sectors(&disk, old_start_lba, new_start_lba, length_sectors)
+    ensure_checkpoint_on_other_disk(checkpoint_path, disk_number)?;
+
+    let raw_disk = crate::raw_io::open_physical_drive_readonly(disk_number)?;
+    let sector = u64::from(raw_disk.geometry().logical_sector_bytes);
+    drop(raw_disk);
+    if sector == 0 {
+        return Err(ParqError::Platform("논리 섹터 크기 0".into()));
+    }
+    let plan = MovePlan {
+        disk_number,
+        src_lba: old_start_lba,
+        dst_lba: new_start_lba,
+        length_sectors,
+        direction: decide_direction(old_start_lba, new_start_lba, length_sectors),
+    };
+    let mut checkpoint = load_checkpoint(checkpoint_path)?
+        .ok_or_else(|| ParqError::Transaction("NTFS 복구 checkpoint가 없습니다".into()))?;
+    validate_boot_patch_checkpoint(&checkpoint, &plan, sector)?;
+
+    let disks = disk::enumerate()?;
+    let layout = disks
+        .iter()
+        .find(|candidate| candidate.number == disk_number)
+        .ok_or_else(|| ParqError::DiskNotFound(format!("disk {disk_number}")))?;
+    let partition = layout
+        .partitions
+        .iter()
+        .find(|candidate| {
+            candidate.offset_bytes == new_start_lba.saturating_mul(sector)
+                && candidate.size_bytes == length_sectors.saturating_mul(sector)
+        })
+        .ok_or_else(|| {
+            ParqError::ValidationFailed(
+                "새 시작 LBA와 길이에 정확히 일치하는 파티션이 없습니다".into(),
+            )
+        })?;
+    safety::check_partition_offline_system_move_lockable(layout, partition)?;
+
+    let extent = crate::raw_io::volume::query_volume_extent(source_drive_letter)?;
+    let expected_offset = new_start_lba
+        .checked_mul(sector)
+        .ok_or_else(|| ParqError::ValidationFailed("새 볼륨 byte offset overflow".into()))?;
+    let expected_length = length_sectors
+        .checked_mul(sector)
+        .ok_or_else(|| ParqError::ValidationFailed("새 볼륨 byte length overflow".into()))?;
+    if extent.disk_number != disk_number
+        || extent.starting_offset_bytes != expected_offset
+        || extent.extent_length_bytes != expected_length
+    {
+        return Err(ParqError::ValidationFailed(format!(
+            "NTFS 복구 볼륨 extent가 이동 결과와 다릅니다: disk={}, offset={}, length={}",
+            extent.disk_number, extent.starting_offset_bytes, extent.extent_length_bytes
+        )));
+    }
+
+    let volume_lock = VolumeLock::lock_and_dismount(source_drive_letter)?;
+    ntfs_boot::update_hidden_sectors_on_locked_volume(
+        &volume_lock,
+        old_start_lba,
+        new_start_lba,
+        length_sectors,
+        sector,
+    )?;
+    checkpoint.phase = "done_boot_metadata".into();
+    write_checkpoint(checkpoint_path, &checkpoint)
+}
+
+fn validate_boot_patch_checkpoint(
+    checkpoint: &Checkpoint,
+    expected_plan: &MovePlan,
+    sector: u64,
+) -> Result<()> {
+    if sector == 0 {
+        return Err(ParqError::ValidationFailed(
+            "checkpoint 검증의 논리 섹터 크기가 0입니다".into(),
+        ));
+    }
+    let base_chunk_sectors = (CHUNK_BYTES / sector).max(1);
+    let expected_chunk_sectors = choose_chunk_sectors(expected_plan, base_chunk_sectors);
+    let expected_chunks_total = expected_plan
+        .length_sectors
+        .div_ceil(expected_chunk_sectors);
+    let hash_is_valid = checkpoint
+        .src_sha256
+        .as_deref()
+        .is_some_and(|hash| hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    if checkpoint.log_format_version != 2
+        || checkpoint.plan != *expected_plan
+        || checkpoint.chunk_sectors != expected_chunk_sectors
+        || checkpoint.chunks_total != expected_chunks_total
+        || checkpoint.chunks_done != checkpoint.chunks_total
+        || !hash_is_valid
+        || !matches!(checkpoint.phase.as_str(), "done" | "done_boot_metadata")
+    {
+        return Err(ParqError::ValidationFailed(
+            "NTFS 복구 checkpoint가 완료된 이동 계획과 정확히 일치하지 않습니다".into(),
+        ));
+    }
+    Ok(())
 }
 
 #[doc(hidden)]
@@ -702,7 +796,9 @@ fn recover_after_table_write(
     {
         return Ok(None);
     }
-    if !checkpoint.phase.starts_with("table_update") && checkpoint.phase != "done" {
+    if !checkpoint.phase.starts_with("table_update")
+        && !matches!(checkpoint.phase.as_str(), "done" | "done_boot_metadata")
+    {
         return Ok(None);
     }
     let start_state = match layout.partition_style {
@@ -714,6 +810,20 @@ fn recover_after_table_write(
         }
         _ => return Ok(None),
     };
+
+    if matches!(checkpoint.phase.as_str(), "done" | "done_boot_metadata")
+        && start_state == partition_table::StartState::New
+    {
+        return finish_completed_checkpoint_without_rehash(
+            layout,
+            disk_number,
+            src_start_lba,
+            new_start_lba,
+            sector,
+            checkpoint,
+        )
+        .map(Some);
+    }
 
     if layout.partition_style == disk::PartitionStyle::Gpt {
         if start_state == partition_table::StartState::Missing {
@@ -759,6 +869,64 @@ fn recover_after_table_write(
         )
         .map(Some),
     }
+}
+
+fn finish_completed_checkpoint_without_rehash(
+    layout: &disk::Disk,
+    disk_number: u32,
+    src_start_lba: u64,
+    new_start_lba: u64,
+    sector: u64,
+    checkpoint: Checkpoint,
+) -> Result<MovePartitionOutcome> {
+    let expected_plan = MovePlan {
+        disk_number,
+        src_lba: src_start_lba,
+        dst_lba: new_start_lba,
+        length_sectors: checkpoint.plan.length_sectors,
+        direction: decide_direction(src_start_lba, new_start_lba, checkpoint.plan.length_sectors),
+    };
+    validate_boot_patch_checkpoint(&checkpoint, &expected_plan, sector)?;
+    let expected_length = checkpoint
+        .plan
+        .length_sectors
+        .checked_mul(sector)
+        .ok_or_else(|| ParqError::ValidationFailed("완료 checkpoint 길이 overflow".into()))?;
+    let partition = layout
+        .partitions
+        .iter()
+        .find(|partition| partition.offset_bytes / sector == new_start_lba)
+        .ok_or_else(|| {
+            ParqError::ValidationFailed("완료 checkpoint의 새 파티션을 찾지 못했습니다".into())
+        })?;
+    if partition.size_bytes != expected_length {
+        return Err(ParqError::ValidationFailed(format!(
+            "완료 checkpoint의 파티션 길이가 현재 GPT와 다릅니다: checkpoint={expected_length}, current={}",
+            partition.size_bytes
+        )));
+    }
+    let sha256 = checkpoint
+        .src_sha256
+        .clone()
+        .ok_or_else(|| ParqError::Transaction("완료 checkpoint에 src_sha256이 없습니다".into()))?;
+    info!(
+        target: "parq::move",
+        src_start_lba,
+        new_start_lba,
+        "완료 checkpoint와 새 GPT 위치 확인 — 데이터 재해시 생략"
+    );
+    Ok(MovePartitionOutcome {
+        data: MoveOutcome {
+            sha256,
+            chunks: checkpoint.chunks_total,
+            direction: checkpoint.plan.direction,
+            resumed: true,
+        },
+        partition_id: partition.id.clone(),
+        old_start_lba: src_start_lba,
+        new_start_lba,
+        length_sectors: checkpoint.plan.length_sectors,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -937,6 +1105,50 @@ fn write_checkpoint(path: &Path, cp: &Checkpoint) -> Result<()> {
 mod tests {
     use super::*;
 
+    fn complete_boot_patch_checkpoint(plan: MovePlan) -> Checkpoint {
+        let chunk_sectors = choose_chunk_sectors(&plan, CHUNK_BYTES / 512);
+        let chunks_total = plan.length_sectors.div_ceil(chunk_sectors);
+        Checkpoint {
+            log_format_version: 2,
+            plan,
+            chunk_sectors,
+            chunks_total,
+            chunks_done: chunks_total,
+            src_sha256: Some("ab".repeat(32)),
+            phase: "done".into(),
+        }
+    }
+
+    fn completed_layout(start_lba: u64, length_sectors: u64) -> disk::Disk {
+        disk::Disk {
+            id: "disk-0".into(),
+            number: 0,
+            model: "test".into(),
+            serial: None,
+            size_bytes: 32 * 1024 * 1024,
+            bus_type: disk::BusType::Virtual,
+            partition_style: disk::PartitionStyle::Gpt,
+            is_removable: false,
+            is_system: false,
+            is_read_only: false,
+            partitions: vec![disk::Partition {
+                id: "partition-1".into(),
+                index: 1,
+                offset_bytes: start_lba * 512,
+                size_bytes: length_sectors * 512,
+                drive_letter: Some("E".into()),
+                label: None,
+                file_system: disk::FileSystemKind::Ntfs,
+                is_boot: false,
+                is_system: false,
+                is_hidden: false,
+                bitlocker_status: disk::BitLockerStatus::NotEncrypted,
+                is_in_use: true,
+            }],
+            is_writable_v1: false,
+        }
+    }
+
     #[test]
     fn overlap_detection() {
         assert!(ranges_overlap(0, 5, 10)); // [0,10) vs [5,15)
@@ -997,6 +1209,72 @@ mod tests {
         );
         assert!(checkpoint_drive_letter(Path::new("move.json")).is_err());
         assert!(checkpoint_drive_letter(Path::new("X:relative.json")).is_err());
+    }
+
+    #[test]
+    fn boot_patch_checkpoint_requires_a_completed_exact_plan() {
+        let plan = MovePlan {
+            disk_number: 0,
+            src_lba: 2048,
+            dst_lba: 4096,
+            length_sectors: 8192,
+            direction: Direction::Backward,
+        };
+        let checkpoint = complete_boot_patch_checkpoint(plan.clone());
+        validate_boot_patch_checkpoint(&checkpoint, &plan, 512).unwrap();
+
+        let mut already_patched = checkpoint.clone();
+        already_patched.phase = "done_boot_metadata".into();
+        validate_boot_patch_checkpoint(&already_patched, &plan, 512).unwrap();
+
+        let mut incomplete = checkpoint.clone();
+        incomplete.chunks_done -= 1;
+        assert!(validate_boot_patch_checkpoint(&incomplete, &plan, 512).is_err());
+
+        let mut wrong_phase = checkpoint.clone();
+        wrong_phase.phase = "verified".into();
+        assert!(validate_boot_patch_checkpoint(&wrong_phase, &plan, 512).is_err());
+
+        let mut wrong_plan = plan.clone();
+        wrong_plan.dst_lba += 1;
+        assert!(validate_boot_patch_checkpoint(&checkpoint, &wrong_plan, 512).is_err());
+        assert!(validate_boot_patch_checkpoint(&checkpoint, &plan, 0).is_err());
+    }
+
+    #[test]
+    fn completed_checkpoint_resumes_without_rehash_when_gpt_is_new() {
+        let plan = MovePlan {
+            disk_number: 0,
+            src_lba: 2048,
+            dst_lba: 4096,
+            length_sectors: 8192,
+            direction: Direction::Backward,
+        };
+        let checkpoint = complete_boot_patch_checkpoint(plan.clone());
+        let layout = completed_layout(plan.dst_lba, plan.length_sectors);
+        let outcome = finish_completed_checkpoint_without_rehash(
+            &layout,
+            plan.disk_number,
+            plan.src_lba,
+            plan.dst_lba,
+            512,
+            checkpoint.clone(),
+        )
+        .unwrap();
+        assert!(outcome.data.resumed);
+        assert_eq!(outcome.data.sha256, "ab".repeat(32));
+        assert_eq!(outcome.length_sectors, plan.length_sectors);
+
+        let wrong_length_layout = completed_layout(plan.dst_lba, plan.length_sectors - 1);
+        assert!(finish_completed_checkpoint_without_rehash(
+            &wrong_length_layout,
+            plan.disk_number,
+            plan.src_lba,
+            plan.dst_lba,
+            512,
+            checkpoint,
+        )
+        .is_err());
     }
 
     #[test]

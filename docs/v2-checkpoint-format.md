@@ -75,7 +75,7 @@ checkpoint = {
     "chunks_total": 200,
     "chunks_done": 137,              // 이 수만큼은 매체에 확정됨(=fsync 완료)
     "next_chunk_index": 137,         // 재개 지점
-    "phase": "copying"               // "planning"|"locked"|"copying"|"verifying"|"verified"|"table_update"|"done"|"aborting"
+    "phase": "copying"               // "planning"|"locked"|"copying"|"verifying"|"verified"|"table_update"|"done"|"done_boot_metadata"|"aborting"
   },
 
   // 무결성 (charter §3-7)
@@ -144,7 +144,8 @@ src/dst 가 겹치고 dst > src (forward) 이면, 앞에서부터 복사할 때 
 | `verifying` | 복사 완료, 대상 SHA256 검증 중 | 대상 SHA256을 다시 계산하고 검증을 재개. |
 | `verified` | 데이터와 인접 영역 검증 완료 | 파티션 이동이면 `table_update`로 진행. raw 영역 이동이면 완료 상태. |
 | `table_update` | 데이터 복사 끝, 파티션 테이블 갱신 중 | §4.2 |
-| `done` | 완료 후 로그 마감 전 | 로그만 `committed` 로 마감. |
+| `done` | 데이터 이동과 파티션 테이블 갱신 완료 | 일반 이동은 로그를 마감. WinPE 시스템 이동은 §4.3. |
+| `done_boot_metadata` | WinPE NTFS boot metadata까지 검증 완료 | 로그만 `committed` 로 마감. |
 | `aborting` | 이미 롤백 중이었음 | 롤백 재개. |
 
 ### 4.1 `copying` 단계 복구
@@ -176,6 +177,18 @@ src→dst 로 바꾸는 중 죽음. 파티션 테이블 쓰기는 **단일 섹�
 > 결론: 데이터 복사(§4.1)와 테이블 갱신(§4.2) **사이에 반드시 무결성 검증(§5)을 통과**시킨다.
 > overlap 이동은 복사 방향으로 미읽은 데이터만 보호한다. 완전한 원본 사본을 보존하지는 않는다.
 > 따라서 checkpoint의 재구성 SHA 검증과 검증된 dst 승격이 복구의 핵심 보증이다.
+
+### 4.3 WinPE NTFS boot metadata 단계 복구
+
+WinPE 시스템 볼륨 이동은 테이블 갱신 완료 뒤 NTFS primary/backup boot sector의 hidden-sectors
+값을 새 시작 LBA로 바꾼다. `done` checkpoint와 GPT가 새 시작 위치를 가리키는데 offline state가
+아직 `moving`이어도 데이터 복사를 반복하지 않고 `patching_ntfs_boot` 단계로 전환한다.
+
+쓰기 전에는 checkpoint의 plan, 청크 기하, `chunks_done == chunks_total`, 원본 SHA-256, 대상과
+다른 체크포인트 디스크를 다시 검증한다. 드라이브 문자의 단일 extent도 대상 디스크, 새 시작 LBA,
+파티션 길이와 정확히 같아야 한다. 두 boot sector는 잠금·분리된 볼륨 핸들로 기록하고 flush 후
+전체 섹터를 되읽어 검증한다. 두 섹터 중 하나만 기록된 상태에서 중단돼도 old/new hidden-sectors를
+모두 허용하는 멱등 패치로 다시 실행할 수 있다. 완료 뒤 phase를 `done_boot_metadata`로 기록한다.
 
 ---
 
